@@ -8,7 +8,7 @@
     "node": ">=22.19.0 <23"
   },
   "scripts": {
-    "dev": "nuxt dev",
+    "dev": "nuxt dev --host 127.0.0.1 --port 3000",
     "build": "nuxt build",
     "preview": "nuxt preview",
     "postinstall": "nuxt prepare",
@@ -26,6 +26,7 @@
     "better-auth": "1.7.6",
     "drizzle-orm": "0.45.3",
     "h3": "1.15.11",
+    "nodemailer": "10.0.11",
     "nuxt": "4.5.2",
     "pino": "10.3.1",
     "postgres": "3.4.9",
@@ -38,6 +39,7 @@
     "@electric-sql/pglite": "0.5.8",
     "@nuxt/test-utils": "4.3.2",
     "@types/node": "22.20.4",
+    "@types/nodemailer": "8.0.2",
     "drizzle-kit": "0.31.11",
     "happy-dom": "20.14.5",
     "tsx": "4.23.15",

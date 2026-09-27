@@ -9,7 +9,7 @@ EngineDes is the implementation repository for the BUMDes Platform.
 - **Codex** — engineering agent; follow `AGENTS.md` before making changes.
 
 ## Current phase
-Core Platform MVP. MBX-5 is in progress: the first implementation provides the Nuxt application, email/password session foundation, scoped Unit listing/creation and transactional audit. Party, numbering, account activation/recovery delivery, configurable security settings and remaining governance are subsequent slices.
+Core Platform MVP. MBX-5 is in progress: Nuxt dashboard, email/password sessions, scoped Units, tenant-admin user management, single-use email activation, basic BUMDes profile settings and transactional audit. SMTP delivery requires operator configuration. Party, numbering, recovery delivery, configurable security settings and remaining governance are subsequent slices.
 
 ## Repository policy
 The accepted stack is TypeScript, Nuxt 4/Vue 3/Nitro, Tailwind 4, PostgreSQL/Drizzle, Better Auth, Zod, Pino and pnpm on Node 22. See [ADR-008](https://app.notion.com/p/3e83269cd65b8183a19cefe174336bfd), [ADR-009](https://app.notion.com/p/3e83269cd65b810092f9dbe51369fba6) and the [decision register](https://app.notion.com/p/3e83269cd65b81cd9b44fbac79f889b1). These remain canonical; local docs describe their implementation.
@@ -28,7 +28,9 @@ corepack pnpm build
 
 The login page and `/api/health` run without database credentials. Login and operational data require a configured PostgreSQL database, migrations, restricted runtime role and initial admin. See [foundation setup and QA](docs/engineering/MBX-5-foundation.md). No default user/password or demo authentication bypass is included.
 
-Tests use PostgreSQL via PGlite with the restricted `enginedes_app` role. This validates SQL/RLS semantics; deployed PostgreSQL connections, Docker builds and email delivery still require environment validation.
+`pnpm dev` uses http://localhost:3000 with loopback binding, Vite HMR for frontend edits and Nitro reload for server edits. Polling is enabled for the exFAT workspace. Nuxt loads `.env` in development; restart the dev process after changing environment/secrets. Stop any built runtime using port 3000 first. Production still uses the built Nitro artifact, without a development watcher.
+
+Tests default to PGlite under restricted `enginedes_app`. `TEST_DATABASE_URL` selects a disposable PostgreSQL database ending in `_test`; optional `TEST_RUNTIME_DATABASE_URL` enables network concurrency tests on that same database. Live PostgreSQL SQL/RLS/auth/concurrency tests have passed in an isolated database. Production infrastructure, Docker and real SMTP delivery remain separate validation tasks.
 
 ## Traceability
 ```

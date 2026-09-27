@@ -42,6 +42,7 @@ export const units = pgTable('units', {
 export const memberships = pgTable('memberships', {
   id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
   userId: text('user_id').notNull().unique().references(() => user.id), active: boolean('active').notNull().default(true),
+  pending: boolean('pending').notNull().default(false),
 }, t => [unique().on(t.tenantId, t.id)])
 export const roleGrants = pgTable('role_grants', {
   id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull().references(() => tenants.id),

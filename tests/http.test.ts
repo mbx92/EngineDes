@@ -19,4 +19,9 @@ describe('[MBX-5][IAM-001/002] Nuxt HTTP boundary', async () => {
     await expect($fetch('/api/auth/sign-up/email', { method: 'POST', body: {} })).rejects.toMatchObject({ status: 404 })
     await expect($fetch('/api/auth/change-password', { method: 'POST', body: {} })).rejects.toMatchObject({ status: 404 })
   })
+  it('[IAM-001/002][CFG-001] protects user/settings APIs and activation Origin', async () => {
+    await expect($fetch('/api/tenants/00000000-0000-4000-8000-000000000001/users')).rejects.toMatchObject({ status: 401 })
+    await expect($fetch('/api/tenants/00000000-0000-4000-8000-000000000001/settings', { method: 'PUT', body: { name: 'Denied' } })).rejects.toMatchObject({ status: 403 })
+    await expect($fetch('/api/activate', { method: 'POST', body: {} })).rejects.toMatchObject({ status: 403 })
+  })
 })

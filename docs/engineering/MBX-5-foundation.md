@@ -7,11 +7,11 @@ Execution: [MBX-5](https://linear.app/mbx92/issue/MBX-5/phase-1-foundation-organ
 ## Implemented slice
 
 - Nuxt 4 on Node 22, native accessible HTML/Tailwind UI, email/password login and logout.
-- Better Auth PostgreSQL sessions: 24-hour expiry, no sliding refresh or cookie data cache, minimum 12-character password, public signup disabled. Only reviewed login/logout/session endpoints are exposed. Activation/reset/change-password endpoints are withheld until delivery, policy and audit paths are implemented.
-- Six role names; each assignment pairs a role with tenant or Unit scope. Initial permissions are `unit.read`, `unit.create`, `account.revoke`. All six roles can read within explicitly granted scope; only tenant-scoped Admin can create Units or revoke tenant-account sessions. No financial posting or approval permissions are granted by these presets.
+- Better Auth PostgreSQL sessions: 24-hour expiry, no sliding refresh or cookie data cache, minimum 12-character password, public signup disabled. Reviewed login/logout/session and the Core `/api/activate` flow are exposed. Reset/change-password endpoints remain withheld until their delivery/policy/audit paths are implemented.
+- Six role names; each assignment pairs a role with tenant or Unit scope. Permissions are `unit.read`, `unit.create`, `account.read`, `account.create`, `account.manage`, `account.revoke` and `organization.update`. All six roles can read Units within explicitly granted scope; only tenant-scoped Admin can create Units, administer users or update the tenant name. No financial posting or approval permissions are granted by these presets.
 - Membership is reloaded per request; one identity belongs to one BUMDes, with multiple Unit/role assignments. Tenant/context comes from verified session and membership, never client-supplied roles.
 - Unit read/create API, page size 50, stable ordering. Creation and audit append share a transaction. Duplicate Unit codes within a BUMDes return 409.
-- Admin-only, tenant-scoped session revocation API. The UI for managing accounts is future work.
+- Admin-only Users UI/API: paginated identities, multiple paired role/Unit grants, pending account creation, invitation resend, grant editing, account disable/enable and session revocation. The final active tenant-scoped admin cannot be removed/disabled. Tenant-serialized writes recheck current actor permission and audit atomically.
 - Forced RLS for operational tables, tenant-aware composite foreign keys, actor-scoped membership discovery. The actor policy permits discovery of the authenticated user's membership before the tenant is known; after verification, transaction-local tenant context controls operational data. Identity/session tables are platform-scoped and inaccessible through general data APIs.
 - App role has no ownership, superuser or BYPASSRLS privilege. Application startup rejects privileged/owner credentials. Audit rows are append-only for the app role.
 - JSON logs carry server-generated request ID, available verified tenant/actor and build identity. They exclude headers/body/query and are separate from persisted audit.
@@ -23,6 +23,22 @@ The dashboard has Ringkasan and Unit Usaha views, verified-session profile/roles
 Browser QA: login, navigation, unmatched search/reset, inactive filter/reset, modal open/cancel and mobile navigation. Unit creation remains covered by Core/API tests; UI inspection does not create sample business data.
 
 ## Environment and database setup
+
+### Users, activation and settings
+
+Pending accounts have `memberships.pending=true`, `active=false` and no password. The recipient creates a password through a random, hashed, 24-hour single-use activation token. Activation atomically creates the Better Auth credential, marks email verified, activates membership, consumes the token and appends audit. Admin APIs never return bearer links/tokens or passwords. Pending accounts cannot be enabled through the status action. Disabling an active account deletes all sessions in the same audited transaction; re-enabling retains its existing password. Changing grants applies to subsequent requests.
+
+Configure `SMTP_HOST`, `SMTP_PORT` (587 STARTTLS or 465 TLS), `SMTP_FROM`, `SMTP_USER` and `SMTP_PASSWORD` in the environment. Nodemailer 10.0.11 uses required TLS, normal certificate validation and no message/protocol logs. The recipient link uses a URL fragment that the activation page removes from browser history; tokens are not in HTTP query strings. Credentials remain server-only. Actual sender/provider and email delivery are still unverified.
+
+Creation commits the pending identity before attempting email delivery. The UI reports `sent`, failed or missing configuration accurately; use resend after fixing SMTP. Resend invalidates the prior token. No durable outbox, automatic retry, password reset or policy/MFA editor is included in this slice. A process interruption between commit and send may require admin resend. SMTP-dependent acceptance is not complete until real delivery is tested.
+
+Basic Settings updates the tenant name using explicit permission and transactional audit. Existing session/password/activation policies are displayed read-only. Security/financial settings and custom permission definitions remain future work.
+
+Migration `0002_quiet_red_shift.sql` adds pending status and scoped membership writes, role-grant insert/delete, and name-only tenant updates. Actor discovery remains SELECT-only; membership INSERT/UPDATE require current tenant context. Applied migrations must not be rewritten.
+
+### Local hot reload
+
+Stop the built server using port 3000, then run `corepack pnpm dev`. Nuxt binds to loopback on port 3000, loads local `.env`, uses Vite HMR for frontend/CSS and Nitro reload for server changes. Polling every 300 ms is enabled for the exFAT workspace. Environment/secrets changes require restarting the dev process. Production uses `.output/server/index.mjs` and does not run HMR/watchers.
 
 Copy `.env.example` locally; never commit credentials. Provide `DATABASE_URL`, `MIGRATION_DATABASE_URL`, `BETTER_AUTH_URL` and a cryptographically random `BETTER_AUTH_SECRET` of at least 32 characters. Set the exact browser origin; mutating Core endpoints reject missing/foreign Origin.
 
@@ -61,8 +77,8 @@ The workspace drive is exFAT: pnpm uses `node-linker=hoisted` and copy imports. 
 5. Revoke a user's sessions through `POST /api/tenants/{tenantId}/accounts/{userId}/revoke` using an authorized admin session and matching Origin. Previous session no longer authenticates. Cross-tenant target is denied and not affected.
 6. With app-role SQL and no context, read no operational tenant rows. Wrong-tenant inserts and cross-tenant foreign keys fail. Reused connections must not retain transaction-local context.
 
-Automated coverage lives in `tests/access.test.ts`, `tests/database.test.ts` and `tests/http.test.ts`. Local tests default to PostgreSQL WASM/PGlite under the restricted role. Set `TEST_DATABASE_URL` to an empty disposable database whose name ends in `_test` to run the same SQL/auth tests through postgres.js; the configured CI job does this with PostgreSQL 18. This CI path is configured, not claimed to have run locally. The harness does not prove production infrastructure, email delivery, Docker image behavior or all MBX-5 acceptance criteria. Those remain required checks.
+Automated coverage lives in `tests/access.test.ts`, `tests/database.test.ts`, `tests/http.test.ts` and `tests/email.test.ts`. Local tests default to PostgreSQL WASM/PGlite under the restricted role. Set `TEST_DATABASE_URL` to an empty disposable database whose name ends in `_test` and `TEST_RUNTIME_DATABASE_URL` to its restricted runtime connection to include real PostgreSQL concurrency coverage. The Users/Settings slice passed 29 tests against an isolated network PostgreSQL database, including concurrent last-admin protection; the temporary database was removed. Typecheck, production build and isolated artifact smoke also passed. CI is configured for PostgreSQL 18 but remote CI has not been run. These checks do not prove production infrastructure, real SMTP delivery, Docker image behavior or all MBX-5 acceptance criteria.
 
 ## Remaining MBX-5 work
 
-Provisioning/activation/reset delivery and account management UI; configurable password policy/MFA; custom permission/grant management with audit; Location assignments; Party and Customer Policy; configuration governance; concurrent numbering; approval-policy separation of duties. ORG-003 and IAM-003 integration require subsequent transaction/approval flows. MBX-5 remains In Progress.
+Real SMTP activation delivery and password recovery/change lifecycle; configurable password policy/MFA; custom permission definitions; Location assignments; Party and Customer Policy; broader configuration governance; concurrent numbering; approval-policy separation of duties. ORG-003 and IAM-003 integration require subsequent transaction/approval flows. MBX-5 remains In Progress.

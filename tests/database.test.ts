@@ -13,6 +13,9 @@ import { withActor } from '../server/core/iam/context'
 import { createUnit, listUnits } from '../server/core/organization/units'
 import { revokeLogin } from '../server/core/iam/revoke'
 import { createAuth } from '../server/auth/options'
+import { createUser, listUsers, resendInvitation, updateGrants, setAccountActive } from '../server/core/iam/users'
+import { activateAccount } from '../server/core/iam/activation'
+import { updateOrganization } from '../server/core/organization/settings'
 
 const A = '00000000-0000-4000-8000-000000000001', B = '00000000-0000-4000-8000-000000000002'
 const A1 = '00000000-0000-4000-8000-000000000011', A2 = '00000000-0000-4000-8000-000000000012', B1 = '00000000-0000-4000-8000-000000000021'
@@ -148,5 +151,96 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
     const expiredCookie = secondLogin.headers.get('set-cookie')!.split(';')[0]!
     await pg.exec(`UPDATE auth_session SET expires_at=now()-interval '1 minute' WHERE user_id='admin-a'`)
     expect(await (await auth.handler(request('get-session', undefined, expiredCookie))).json()).toBeNull()
+  })
+
+  it('[IAM-001/002][ORG-002] admin provisions pending identities; role/Unit grants remain scoped', async () => {
+    const input = { name: 'Invited operator', email: 'invited@example.test', grants: [{ role: 'operator', scope: 'unit', unitId: A1 }] }
+    await expect(withActor(db, 'operator-a', A, (tx, actor) => createUser(tx, actor, input, randomUUID()))).rejects.toThrow()
+    await expect(withActor(db, 'admin-a', A, (tx, actor) => createUser(tx, actor, { ...input, grants: [{ role: 'operator', scope: 'unit', unitId: B1 }] }, randomUUID()))).rejects.toThrow()
+    const invite = await withActor(db, 'admin-a', A, (tx, actor) => createUser(tx, actor, input, randomUUID()))
+    const listed = await withActor(db, 'admin-a', A, (tx, actor) => listUsers(tx, actor, {}))
+    expect(listed.find(item => item.id === invite.userId)).toMatchObject({ active: false, pending: true, grants: input.grants })
+    expect(listed.some(item => item.id === 'user-b')).toBe(false)
+    await expect(withActor(db, 'operator-a', A, (tx, actor) => listUsers(tx, actor, {}))).rejects.toThrow()
+    await expect(withActor(db, 'admin-a', B, (tx, actor) => listUsers(tx, actor, {}))).rejects.toThrow()
+    const stored = await pg.query<{ value: string; hours: number }>('SELECT value, extract(epoch FROM (expires_at-created_at))/3600 AS hours FROM auth_verification WHERE identifier=$1', ['enginedes.activation.' + invite.userId])
+    expect(stored.rows[0]!.value).not.toBe(invite.token)
+    expect(Number(stored.rows[0]!.hours)).toBeCloseTo(24, 1)
+    await expect(withActor(db, invite.userId, A, listUnits)).rejects.toThrow()
+  })
+
+  it('[IAM-001][AUDIT-001] resend invalidates old link; activation is atomic, single-use and creates a working login', async () => {
+    const invite = await withActor(db, 'admin-a', A, (tx, actor) => createUser(tx, actor, { name: 'Activation', email: 'activate@example.test', grants: [{ role: 'operator', scope: 'unit', unitId: A1 }] }, randomUUID()))
+    const next = await withActor(db, 'admin-a', A, (tx, actor) => resendInvitation(tx, actor, invite.userId, randomUUID()))
+    await expect(activateAccount(db, { userId: invite.userId, token: invite.token, password }, randomUUID())).rejects.toThrow()
+    await expect(activateAccount(db, { userId: invite.userId, token: next.token, password }, 'invalid-request-id')).rejects.toThrow()
+    expect((await pg.query('SELECT id FROM auth_account WHERE user_id=$1', [invite.userId])).rows).toEqual([])
+    await activateAccount(db, { userId: invite.userId, token: next.token, password }, randomUUID())
+    expect((await pg.query<{ email_verified: boolean }>('SELECT email_verified FROM auth_user WHERE id=$1', [invite.userId])).rows[0]?.email_verified).toBe(true)
+    await expect(activateAccount(db, { userId: invite.userId, token: next.token, password }, randomUUID())).rejects.toThrow()
+    const login = await auth.handler(new Request('http://localhost:3000/api/auth/sign-in/email', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://localhost:3000' }, body: JSON.stringify({ email: invite.email, password, rememberMe: false }) }))
+    expect(login.status).toBe(200)
+    const cookie = login.headers.get('set-cookie')!.split(';')[0]!
+    expect((await withActor(db, invite.userId, A, listUnits)).map(unit => unit.id)).toEqual([A1])
+    await withActor(db, 'admin-a', A, (tx, actor) => setAccountActive(tx, actor, invite.userId, { active: false }, randomUUID()))
+    expect((await pg.query('SELECT id FROM auth_session WHERE user_id=$1', [invite.userId])).rows).toEqual([])
+    const current = await auth.handler(new Request('http://localhost:3000/api/auth/get-session', { headers: { cookie } }))
+    expect(await current.json()).toBeNull()
+    await expect(withActor(db, invite.userId, A, listUnits)).rejects.toThrow()
+    await withActor(db, 'admin-a', A, (tx, actor) => setAccountActive(tx, actor, invite.userId, { active: true }, randomUUID()))
+    await withActor(db, 'admin-a', A, (tx, actor) => updateGrants(tx, actor, invite.userId, { grants: [{ role: 'supervisor', scope: 'unit', unitId: A2 }] }, randomUUID()))
+    expect((await withActor(db, invite.userId, A, listUnits)).map(unit => unit.id)).toEqual([A2])
+  })
+
+  it('[IAM-001][AUDIT-001] expired activation and manual pending enable are denied', async () => {
+    const invite = await withActor(db, 'admin-a', A, (tx, actor) => createUser(tx, actor, { name: 'Expired', email: 'expired@example.test', grants: [{ role: 'operator', scope: 'unit', unitId: A1 }] }, randomUUID()))
+    await pg.exec("UPDATE auth_verification SET expires_at=now()-interval '1 minute'")
+    await expect(activateAccount(db, { userId: invite.userId, token: invite.token, password }, randomUUID())).rejects.toThrow()
+    await expect(withActor(db, 'admin-a', A, (tx, actor) => setAccountActive(tx, actor, invite.userId, { active: true }, randomUUID()))).rejects.toThrow('mengaktivasi')
+  })
+
+  it('[IAM-001/002][AUDIT-001] last admin, cross-tenant targets and invalid grant escalation are protected', async () => {
+    await expect(withActor(db, 'admin-a', A, (tx, actor) => setAccountActive(tx, actor, 'admin-a', { active: false }, randomUUID()))).rejects.toThrow('admin aktif')
+    await expect(withActor(db, 'admin-a', A, (tx, actor) => updateGrants(tx, actor, 'admin-a', { grants: [{ role: 'operator', scope: 'tenant', unitId: null }] }, randomUUID()))).rejects.toThrow('admin aktif')
+    await expect(withActor(db, 'admin-a', A, (tx, actor) => setAccountActive(tx, actor, 'user-b', { active: false }, randomUUID()))).rejects.toThrow('Target not in tenant')
+    await expect(withActor(db, 'admin-a', A, (tx, actor) => updateGrants(tx, actor, 'operator-a', { grants: [{ role: 'admin', scope: 'unit', unitId: A1 }] }, randomUUID()))).rejects.toThrow()
+    await expect(withActor(db, 'admin-a', A, (tx, actor) => updateGrants(tx, actor, 'operator-a', { grants: [{ role: 'operator', scope: 'unit', unitId: B1 }] }, randomUUID()))).rejects.toThrow()
+    expect((await withActor(db, 'admin-a', A, (tx, actor) => listUsers(tx, actor, {}))).find(u => u.id === 'admin-a')?.active).toBe(true)
+  })
+
+  it('[AUDIT-001][CFG-001] user provisioning and profile edits roll back on audit failure', async () => {
+    const input = { name: 'Rollback', email: 'rollback-user@example.test', grants: [{ role: 'operator', scope: 'tenant', unitId: null }] }
+    await expect(withActor(db, 'admin-a', A, (tx, actor) => createUser(tx, actor, input, 'invalid'))).rejects.toThrow()
+    expect((await pg.query('SELECT id FROM auth_user WHERE email=$1', [input.email])).rows).toEqual([])
+    await expect(withActor(db, 'operator-a', A, (tx, actor) => updateOrganization(tx, actor, { name: 'Denied' }, randomUUID()))).rejects.toThrow()
+    await expect(withActor(db, 'admin-a', A, (tx, actor) => updateOrganization(tx, actor, { name: 'Rollback tenant' }, 'invalid'))).rejects.toThrow()
+    await withActor(db, 'admin-a', A, (tx, actor) => updateOrganization(tx, actor, { name: 'BUMDes A updated' }, randomUUID()))
+    expect((await withActor(db, 'admin-a', A, tx => tx.select({ name: schema.tenants.name }).from(schema.tenants))).map(t => t.name)).toEqual(['BUMDes A updated'])
+  })
+
+  it('[NFR-SEC-002] membership mutation requires matching tenant context independently of actor discovery', async () => {
+    await expect(withActor(db, 'admin-a', A, tx => tx.execute(sql`INSERT INTO memberships(tenant_id,user_id) VALUES (${B},'admin-a')`))).rejects.toThrow()
+    await withActor(db, 'admin-a', A, async tx => {
+      expect(rowsOf(await tx.execute(sql`UPDATE memberships SET active=false WHERE tenant_id=${B} RETURNING id`))).toEqual([])
+    })
+  })
+
+  it.runIf(!!process.env.TEST_RUNTIME_DATABASE_URL)('[IAM-001][NFR-REL-001] concurrent admin disable preserves one active admin on network PostgreSQL', async () => {
+    const invite = await withActor(db, 'admin-a', A, (tx, actor) => createUser(tx, actor, { name: 'Concurrent admin', email: 'concurrent@example.test', grants: [{ role: 'admin', scope: 'tenant', unitId: null }] }, randomUUID()))
+    await activateAccount(db, { userId: invite.userId, token: invite.token, password }, randomUUID())
+    const runtimeUrl = new URL(process.env.TEST_RUNTIME_DATABASE_URL!)
+    if (!runtimeUrl.pathname.endsWith('_test') || runtimeUrl.pathname !== new URL(process.env.TEST_DATABASE_URL!).pathname) throw new Error('Concurrency runtime must use the same disposable test database')
+    const connection = postgres(runtimeUrl.toString(), { max: 2 })
+    const parallel = postgresDrizzle(connection, { schema })
+    try {
+      const results = await Promise.allSettled([
+        withActor(parallel, 'admin-a', A, (tx, actor) => setAccountActive(tx, actor, 'admin-a', { active: false }, randomUUID())),
+        withActor(parallel, invite.userId, A, (tx, actor) => setAccountActive(tx, actor, invite.userId, { active: false }, randomUUID())),
+      ])
+      expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+      expect(results.filter(result => result.status === 'rejected')).toHaveLength(1)
+      if (results[0]!.status === 'fulfilled') await withActor(parallel, invite.userId, A, (tx, actor) => setAccountActive(tx, actor, 'admin-a', { active: true }, randomUUID()))
+      await withActor(parallel, 'admin-a', A, (tx, actor) => setAccountActive(tx, actor, invite.userId, { active: false }, randomUUID()))
+    } finally { await connection.end() }
   })
 })

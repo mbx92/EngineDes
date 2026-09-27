@@ -4,6 +4,7 @@ import { getAuth } from '../auth'
 import { getDatabase, type Transaction } from '../database/client'
 import { AccessDenied, type ActorAccess } from '../core/iam/access'
 import { withActor } from '../core/iam/context'
+import { ManagementConflict } from '../core/iam/users'
 
 export function requireSameOrigin(event: H3Event) {
   const configured = process.env.BETTER_AUTH_URL
@@ -26,6 +27,7 @@ export async function authenticated<T>(event: H3Event, tenantId: string | undefi
   catch (error) {
     if (error instanceof AccessDenied) throw createError({ statusCode: 403, statusMessage: 'Access denied' })
     if (error instanceof z.ZodError) throw createError({ statusCode: 400, statusMessage: 'Invalid input' })
+    if (error instanceof ManagementConflict) throw createError({ statusCode: 409, statusMessage: error.message })
     // PostgreSQL unique violation, including errors wrapped by Drizzle.
     const cause = error as { code?: string; cause?: { code?: string } }
     if (cause.code === '23505' || cause.cause?.code === '23505') throw createError({ statusCode: 409, statusMessage: 'Record already exists' })

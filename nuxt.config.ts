@@ -6,9 +6,10 @@ export default defineNuxtConfig({
   devtools: { enabled: false },
   telemetry: false,
   css: ['~/assets/css/main.css'],
-  vite: { plugins: [tailwindcss()] },
+  vite: { plugins: [tailwindcss()], server: { watch: { usePolling: true, interval: 300 } } },
   nitro: {
     preset: 'node-server',
+    watchOptions: { usePolling: true, interval: 300 },
     // Bundle JS dependencies so the artifact works on exFAT and inside a standalone container.
     externals: { inline: [/.*/] },
     // CommonJS requires Node's default export (e.g. events), not its ESM namespace.
