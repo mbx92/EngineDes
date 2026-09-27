@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Engineering work is tracked in Linear
+    url: https://linear.app/mbx92/project/bumdes-platform-core-mvp-c077a55470f2
+    about: Create and manage implementation work in Linear so requirement traceability is preserved.
