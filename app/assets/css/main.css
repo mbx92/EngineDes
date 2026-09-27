@@ -140,6 +140,13 @@ svg{
 input::placeholder{
   color:#9ba5b3
 }
+/* [MBX-5][IAM-001] Field focus uses the border without an outer ring. */
+.field input:focus-visible,
+.field textarea:focus-visible,
+.field select:focus-visible{
+  border-color:#269b82;
+  outline:none
+}
 .field small{
   color:#7c8899;
   font-weight:400;
@@ -1194,7 +1201,11 @@ tbody tr:hover{
 .grant-editor .field { margin: 0; }
 .grant-unit { grid-column: 1 / -1; }
 .grant-remove { justify-self: start; grid-column: 1 / -1; }
-.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+.settings-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
+.settings-tabs { display: flex; gap: 24px; overflow-x: auto; border-bottom: 1px solid #dbe2e9; }
+.settings-tabs button { display: flex; align-items: center; gap: 8px; padding: 12px 0; border: 0; border-bottom: 2px solid transparent; background: transparent; color: #6b788b; font-size: 13px; font-weight: 500; }
+.settings-tabs button:hover { color: #243146; }
+.settings-tabs button[aria-selected="true"] { color: #07886d; border-bottom-color: #07886d; }
 .settings-card { padding: 25px; }
 .settings-card h2 { font-size: 17px; font-weight: 600; }
 .settings-card form { margin-top: 25px; }
@@ -1209,3 +1220,12 @@ tbody tr:hover{
 .activation-card .login-form { margin-top: 25px; }
 .workspace-switch strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 145px; }
 @media (max-width: 760px) { .settings-grid { grid-template-columns: 1fr; } .section-actions { align-items: flex-start; } .section-actions .button { white-space: nowrap; } .grant-editor { grid-template-columns: 1fr; } }
+
+/* [MBX-5][CFG-001] Governance forms and responsive settings tabs. */
+.settings-tabs button { white-space: nowrap; }
+.governance-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.governance-form { display: grid; gap: 18px; max-width: 600px; }
+.governance-form .button { justify-self: start; margin-top: 0; }
+.checkbox-field { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+.configured-types { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; }
+@media (max-width: 600px) { .governance-heading { align-items: flex-start; flex-direction: column; } }

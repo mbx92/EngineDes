@@ -17,7 +17,9 @@
     "test:artifact": "node scripts/smoke-artifact.mjs",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx scripts/migrate.ts",
-    "db:bootstrap": "tsx scripts/bootstrap.ts"
+    "db:bootstrap": "tsx scripts/bootstrap.ts",
+    "db:seed": "node --env-file=.env --import tsx scripts/seed.ts",
+    "test:postgres": "node --env-file=.env --import tsx scripts/validate-postgres.ts"
   },
   "dependencies": {
     "@better-auth/drizzle-adapter": "1.7.6",

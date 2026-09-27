@@ -42,6 +42,8 @@ Migration `0002_quiet_red_shift.sql` adds pending status and scoped membership w
 
 ### Local hot reload
 
+Nitro resolves `hookable` from its own dependency directory via `nitro.alias` in `nuxt.config.ts` ([MBX-5][NFR-MNT-002]). With the hoisted install, dev bundle imports otherwise resolve the workspace's Hookable 6 instead of Nitro 2's Hookable 5. Hookable 6 can return `undefined` for synchronous/empty hooks, breaking Nitro's `.catch()` calls during requests and worker shutdown. Keep the alias tied to Nitro's installed dependency rather than editing generated `.nuxt` files or dependency source. Verified on macOS with dev worker reload, health/session HTTP 200 and typecheck.
+
 Stop the built server using port 3000, then run `corepack pnpm dev`. Nuxt binds to loopback on port 3000, loads local `.env`, uses Vite HMR for frontend/CSS and Nitro reload for server changes. Polling every 300 ms is enabled for the exFAT workspace. Environment/secrets changes require restarting the dev process. Production uses `.output/server/index.mjs` and does not run HMR/watchers.
 
 Copy `.env.example` locally; never commit credentials. Provide `DATABASE_URL`, `MIGRATION_DATABASE_URL`, `BETTER_AUTH_URL` and a cryptographically random `BETTER_AUTH_SECRET` of at least 32 characters. Set the exact browser origin; mutating Core endpoints reject missing/foreign Origin.
@@ -83,6 +85,28 @@ The workspace drive is exFAT: pnpm uses `node-linker=hoisted` and copy imports. 
 
 Automated coverage lives in `tests/access.test.ts`, `tests/database.test.ts`, `tests/http.test.ts`, `tests/email.test.ts` and `tests/activation-link.test.ts`. Local tests default to PostgreSQL WASM/PGlite under the restricted role. Set `TEST_DATABASE_URL` to an empty disposable database whose name ends in `_test` and `TEST_RUNTIME_DATABASE_URL` to its restricted runtime connection to include real PostgreSQL concurrency coverage. The Users/Settings/direct-link slice passed 35 tests against an isolated network PostgreSQL database, including concurrent last-admin protection, manual/email token invalidation, denied non-admin/cross-tenant issuance, audit rollback, expiry/replay and successful manually activated login without false email verification; the temporary database was removed. Typecheck, production build and isolated artifact smoke also passed. CI is configured for PostgreSQL 18 but remote CI has not been run. These checks do not prove production infrastructure, real SMTP delivery, Docker image behavior or all MBX-5 acceptance criteria.
 
-## Remaining MBX-5 work
+## Foundation completion — MBX-5 / MBX-15
 
-Real SMTP activation delivery and password recovery/change lifecycle; configurable password policy/MFA; custom permission definitions; Location assignments; Party and Customer Policy; broader configuration governance; concurrent numbering; approval-policy separation of duties. ORG-003 and IAM-003 integration require subsequent transaction/approval flows. MBX-5 remains In Progress.
+The Phase 1 foundation includes tenant-owned Person/Organization Party records, Customer/Vendor/Employee roles with tenant/Unit context, Location master data, and location-restricted role assignments. Admin manages Party and Locations; Party read visibility is scoped to contextual customer/vendor assignments. Scoped Location grants cannot authorize unrestricted Unit commands or another Location. New tables use forced RLS, composite tenant-aware references, and runtime credentials without ownership/bypass privileges.
+
+Customer Policy, security/context settings and document sequences are available in Settings tabs. Sensitive edits require tenant-admin `configuration.manage`, optimistic revision checks, current authority recheck under the tenant lock, revision history and transactional audit. Default security settings use UTC, minimum password 12 and separation of duties enabled. Timezone accepts valid IANA identifiers; password minimum is configurable from 12 to 128 and enforced at recipient activation. Existing passwords are not invalidated by a settings change. Sequence formats are immutable after creation; create a new document type for another format. Runtime cannot update/delete configuration revision history or allocated document numbers. Audit is available to explicitly authorized tenant-wide readers.
+
+`validateTransactionContext` is the required Foundation boundary for transaction-producing modules: valid active Unit, active Location within that Unit, current permission/scope, authorized anonymous Customer Policy, and a real active Customer Party for AR. `requireApproval` checks a persisted document's tenant/Unit/Location and creator against current explicit approval permission and configured separation of duties. Director has approval permission; Admin alone does not. Consumers call these services inside their business write transaction. There is no Foundation financial-posting endpoint or module ledger. MBX-6/7 and MBX-11 must integrate and retest these guards with actual accounting/procurement flows.
+
+`allocateNumber` is transaction-bound, serialized for concurrent counters and same-command retries, preserves an existing number for matching retry context, rejects mismatched retries, and rolls back counters/allocations with audit or business-write failure. Numbers and configuration revisions preserve historical interpretation. The caller supplies a validated business period (YYYY or YYYY-MM according to configured reset); the consuming module must derive that period from its approved business-date policy. Tenant lock precedes command/counter locks, matching configuration/authority writes. Numbering does not authorize financial posting.
+
+### Local dummy data
+
+After migration and bootstrap:
+
+```sh
+corepack pnpm db:seed
+```
+
+The command requires local `enginedes` URLs, rejects production/remote databases, uses the restricted runtime principal and explicitly selects an active tenant admin. Set `SEED_TENANT_ID` if more than one local tenant is present. It seeds 3 DEMO Units, 6 Locations, 5 Parties including multi-role Person/Organization identities, 3 pending demo accounts with reserved `example.test` emails, and `demo_cash` customer/sequence settings. It does not set login passwords, send emails, allocate financial documents, alter the existing admin, or create journals. Use existing admin-issued activation links for any demo account you choose to activate. A repeated seed creates zero extra data and does not reset existing state.
+
+### Validation and consuming-phase gates
+
+`node --env-file=.env --import tsx scripts/validate-postgres.ts` creates a uniquely named disposable local test database, runs the full suite with restricted-role queries and actual parallel connections, then removes it. Tests cover RLS/FKs, tenant/Unit/Location denial, Party roles and visibility, anonymous versus AR policy, creator self-approval denial even with multiple roles, unauthorized configuration and revision conflicts, rollback on audit failure, immutable history, sequence retries/concurrency, and seed idempotence. HTTP tests cover authentication/Origin boundaries for the new APIs.
+
+MBX-15 closes scaffold-affecting choices and records explicit dependent-phase gates. This does not select an unapproved monetary rounding policy, financial business timezone, queue/PDF/storage provider, or production infrastructure. MBX-6/7 own financial precision/date/idempotency/posting-vs-closing decisions and integration; MBX-11 owns full approval workflow; MBX-12 owns report renderer/storage decisions; MBX-14 owns production hosting/Node patch/security review, real SMTP delivery, recovery/password-change lifecycle, future configurable MFA/custom role editor, backups/restore and release acceptance. These are not represented as implemented by the Phase 1 foundation.

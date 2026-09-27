@@ -13,7 +13,7 @@ export async function withActor<T>(db: Database, userId: string, requestedTenant
     await tx.execute(sql`SELECT set_config('app.tenant_id', ${member.tenantId}, true)`)
     const [tenant] = await tx.select().from(tenants).where(and(eq(tenants.id, member.tenantId), eq(tenants.active, true)))
     if (!tenant) throw new AccessDenied('Tenant inactive')
-    const grants = await tx.select({ role: roleGrants.role, scope: roleGrants.scope, unitId: roleGrants.unitId })
+    const grants = await tx.select({ role: roleGrants.role, scope: roleGrants.scope, unitId: roleGrants.unitId, locationId: roleGrants.locationId })
       .from(roleGrants).where(and(eq(roleGrants.tenantId, member.tenantId), eq(roleGrants.membershipId, member.id)))
     return operation(tx, { userId, tenantId: member.tenantId, membershipId: member.id, grants })
   })

@@ -31,4 +31,12 @@ describe('[MBX-5][IAM-001/002] Nuxt HTTP boundary', async () => {
     await expect($fetch('/api/tenants/00000000-0000-4000-8000-000000000001/settings', { method: 'PUT', body: { name: 'Denied' } })).rejects.toMatchObject({ status: 403 })
     await expect($fetch('/api/activate', { method: 'POST', body: {} })).rejects.toMatchObject({ status: 403 })
   })
+  it('[PARTY-001][ORG-002][CFG-001][AUDIT-001] protects foundation APIs before accessing tenant data', async () => {
+    const root = '/api/tenants/00000000-0000-4000-8000-000000000001/'
+    for (const resource of ['parties','locations','configurations','audit']) {
+      await expect($fetch(root + resource)).rejects.toMatchObject({ status:401 })
+      if (resource !== 'audit') await expect($fetch(root + resource,{method:'POST',body:{}})).rejects.toMatchObject({status:403})
+    }
+    await expect($fetch(root + 'parties/00000000-0000-4000-8000-000000000011',{method:'PUT',body:{}})).rejects.toMatchObject({status:403})
+  })
 })

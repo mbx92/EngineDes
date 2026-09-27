@@ -6,6 +6,7 @@ import type { Database } from '../../database/client'
 import { account, auditEvents, memberships, tenants, verification, user } from '../../database/schema'
 import { AccessDenied } from './access'
 import { activationIdentifier, hashActivationToken } from './users'
+import { securityPolicy } from '../governance/configuration'
 
 // MBX-5 / IAM-001, AUDIT-001. Possession of a live hashed token is the activation proof.
 export async function activateAccount(db: Database, input: unknown, requestId: string) {
@@ -23,6 +24,7 @@ export async function activateAccount(db: Database, input: unknown, requestId: s
     const [token] = await tx.select().from(verification).where(and(inArray(verification.identifier, identifiers), eq(verification.value, hashActivationToken(data.token)), gt(verification.expiresAt, new Date()))).for('update')
     const [current] = await tx.select().from(memberships).where(eq(memberships.id, member.id))
     if (!token || !current?.pending || current.active) throw new AccessDenied('Activation invalid')
+    if (data.password.length < (await securityPolicy(tx, member.tenantId)).passwordMinimum) throw new AccessDenied('Password does not satisfy tenant policy')
     const password = await hashPassword(data.password)
     await tx.insert(account).values({ id: randomUUID(), accountId: data.userId, providerId: 'credential', userId: data.userId, password })
     await tx.update(memberships).set({ active: true, pending: false }).where(eq(memberships.id, member.id))
