@@ -11,7 +11,7 @@
 body{
   margin:0
 }
-button,input,select{
+button,input,select,textarea{
   font:inherit
 }
 button{
@@ -21,7 +21,7 @@ button:disabled{
   opacity:.5;
   cursor:not-allowed
 }
-button,a,input,select{
+button,a,input,select,textarea{
   outline-offset:4px
 }
 :focus-visible{
@@ -125,6 +125,17 @@ svg{
   font-weight:400;
   color:#243146;
   background:white
+}
+.field textarea{
+  width:100%;
+  resize:vertical;
+  border:1px solid #dbe2e9;
+  padding:12px 13px;
+  border-radius:8px;
+  color:#243146;
+  background:white;
+  font-weight:400;
+  overflow-wrap:anywhere
 }
 input::placeholder{
   color:#9ba5b3

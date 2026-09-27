@@ -26,4 +26,13 @@ describe('[MBX-5][IAM-001/002][ORG-002] paired role and scope', () => {
   it('rejects malformed tenant scope carrying a Unit', () => {
     expect(can({ ...access, grants: [{ role: 'admin', scope: 'tenant', unitId: 'A1' }] }, 'unit.create', 'A')).toBe(false)
   })
+  it('allows direct activation links only for a tenant-scoped admin', () => {
+    expect(can(access, 'account.activation_link', 'A')).toBe(false)
+    for (const role of ['director', 'finance', 'unit_manager', 'operator', 'supervisor'] as const) {
+      expect(can({ ...access, grants: [{ role, scope: 'tenant', unitId: null }] }, 'account.activation_link', 'A')).toBe(false)
+    }
+    const admin = { ...access, grants: [{ role: 'admin' as const, scope: 'tenant' as const, unitId: null }] }
+    expect(can(admin, 'account.activation_link', 'A')).toBe(true)
+    expect(can(admin, 'account.activation_link', 'B')).toBe(false)
+  })
 })

@@ -1,6 +1,7 @@
 import nodemailer from 'nodemailer'
+import { activationLink } from '../core/iam/activation-link'
 export function smtpConfigured() { return !!(process.env.SMTP_HOST && process.env.SMTP_FROM && process.env.SMTP_USER && process.env.SMTP_PASSWORD) }
-// No password or activation token is returned to the admin UI or logged.
+// Normal email delivery returns status only; direct admin links use a separate endpoint.
 export async function deliverActivation(data: { email: string; userId: string; token: string }) {
   if (!smtpConfigured()) return { emailDelivery: 'not_configured' as const }
   try {
@@ -9,10 +10,7 @@ export async function deliverActivation(data: { email: string; userId: string; t
     const transport = nodemailer.createTransport({ host: process.env.SMTP_HOST, port, secure: port === 465, requireTLS: true,
       auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD }, connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 15000,
       logger: false, debug: false, disableFileAccess: true, disableUrlAccess: true })
-    const url = new URL('/activate', process.env.BETTER_AUTH_URL)
-    // Fragment keeps bearer tokens out of server requests, query logs and referrers.
-    url.hash = new URLSearchParams({ user: data.userId, token: data.token }).toString()
-    const result = await transport.sendMail({ from: process.env.SMTP_FROM, to: data.email, subject: 'Aktivasi akun EngineDes', text: 'Aktifkan akun Anda dan buat password melalui tautan berikut (berlaku 24 jam, sekali pakai):\n\n' + url.toString() })
+    const result = await transport.sendMail({ from: process.env.SMTP_FROM, to: data.email, subject: 'Aktivasi akun EngineDes', text: 'Aktifkan akun Anda dan buat password melalui tautan berikut (berlaku 24 jam, sekali pakai):\n\n' + activationLink(data, process.env.BETTER_AUTH_URL) })
     return { emailDelivery: result.accepted.length ? 'sent' as const : 'failed' as const }
   } catch { return { emailDelivery: 'failed' as const } }
 }

@@ -13,7 +13,7 @@ import { withActor } from '../server/core/iam/context'
 import { createUnit, listUnits } from '../server/core/organization/units'
 import { revokeLogin } from '../server/core/iam/revoke'
 import { createAuth } from '../server/auth/options'
-import { createUser, listUsers, resendInvitation, updateGrants, setAccountActive } from '../server/core/iam/users'
+import { createUser, listUsers, resendInvitation, updateGrants, setAccountActive, issueManualActivation } from '../server/core/iam/users'
 import { activateAccount } from '../server/core/iam/activation'
 import { updateOrganization } from '../server/core/organization/settings'
 
@@ -197,6 +197,55 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
     await pg.exec("UPDATE auth_verification SET expires_at=now()-interval '1 minute'")
     await expect(activateAccount(db, { userId: invite.userId, token: invite.token, password }, randomUUID())).rejects.toThrow()
     await expect(withActor(db, 'admin-a', A, (tx, actor) => setAccountActive(tx, actor, invite.userId, { active: true }, randomUUID()))).rejects.toThrow('mengaktivasi')
+  })
+
+  it('[IAM-001/002][AUDIT-001] direct activation requires tenant admin, audits issuance and preserves recipient password choice', async () => {
+    const invite = await withActor(db, 'admin-a', A, (tx, actor) => createUser(tx, actor, { name: 'Direct activation', email: 'direct@example.test', grants: [{ role: 'operator', scope: 'unit', unitId: A1 }] }, randomUUID()))
+    await expect(withActor(db, 'operator-a', A, (tx, actor) => issueManualActivation(tx, actor, invite.userId, randomUUID()))).rejects.toThrow()
+    await expect(withActor(db, 'admin-a', A, (tx, actor) => issueManualActivation(tx, actor, 'user-b', randomUUID()))).rejects.toThrow('Target not in tenant')
+    await expect(withActor(db, 'admin-a', B, (tx, actor) => issueManualActivation(tx, actor, invite.userId, randomUUID()))).rejects.toThrow()
+    await expect(withActor(db, 'admin-a', A, (tx, actor) => issueManualActivation(tx, actor, invite.userId, 'invalid-audit'))).rejects.toThrow()
+    await expect(withActor(db, 'admin-a', A, async (tx, actor) => {
+      await tx.execute(sql`DELETE FROM role_grants WHERE membership_id=${MA}`)
+      return issueManualActivation(tx, actor, invite.userId, randomUUID())
+    })).rejects.toThrow('Permission or scope denied')
+    // Rollback preserves the existing email token instead of leaving the recipient stranded.
+    expect((await pg.query<{ count: number }>('SELECT count(*)::int AS count FROM auth_verification WHERE identifier=$1', ['enginedes.activation.' + invite.userId])).rows[0]?.count).toBe(1)
+    const requestId = randomUUID()
+    const manual = await withActor(db, 'admin-a', A, (tx, actor) => issueManualActivation(tx, actor, invite.userId, requestId))
+    const stored = await pg.query<{ value: string; hours: number }>('SELECT value, extract(epoch FROM (expires_at-created_at))/3600 AS hours FROM auth_verification WHERE identifier=$1', ['enginedes.activation.manual.' + invite.userId])
+    expect(stored.rows[0]?.value).not.toBe(manual.token)
+    expect(Number(stored.rows[0]?.hours)).toBeCloseTo(24, 1)
+    expect((await pg.query('SELECT id FROM auth_account WHERE user_id=$1', [invite.userId])).rows).toEqual([])
+    await expect(withActor(db, invite.userId, A, listUnits)).rejects.toThrow()
+    await expect(activateAccount(db, { userId: invite.userId, token: invite.token, password }, randomUUID())).rejects.toThrow()
+    await withActor(db, 'admin-a', A, async tx => {
+      const audits = rowsOf(await tx.execute(sql`SELECT actor_id,request_id,after FROM audit_events WHERE entity_id=${invite.userId} AND action='account.activation_link_issued'`))
+      expect(audits).toEqual([{ actor_id: 'admin-a', request_id: requestId, after: { delivery: 'manual', expiresInHours: 24 } }])
+      expect(JSON.stringify(audits)).not.toContain(manual.token)
+    })
+    await expect(activateAccount(db, { ...manual, password: 'too-short' }, randomUUID())).rejects.toThrow()
+    await expect(activateAccount(db, { ...manual, password }, 'invalid-audit')).rejects.toThrow()
+    expect((await pg.query('SELECT id FROM auth_account WHERE user_id=$1', [invite.userId])).rows).toEqual([])
+    await activateAccount(db, { ...manual, password }, randomUUID())
+    expect((await pg.query<{ email_verified: boolean }>('SELECT email_verified FROM auth_user WHERE id=$1', [invite.userId])).rows[0]?.email_verified).toBe(false)
+    await expect(activateAccount(db, { ...manual, password }, randomUUID())).rejects.toThrow()
+    await expect(withActor(db, 'admin-a', A, (tx, actor) => issueManualActivation(tx, actor, invite.userId, randomUUID()))).rejects.toThrow('menunggu aktivasi')
+    const login = await auth.handler(new Request('http://localhost:3000/api/auth/sign-in/email', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://localhost:3000' }, body: JSON.stringify({ email: invite.email, password, rememberMe: false }) }))
+    expect(login.status).toBe(200)
+    expect((await withActor(db, invite.userId, A, listUnits)).map(unit => unit.id)).toEqual([A1])
+  })
+  it('[IAM-001][AUDIT-001] manual/email issuance replace each other; expired manual tokens fail', async () => {
+    const invite = await withActor(db, 'admin-a', A, (tx, actor) => createUser(tx, actor, { name: 'Manual expiry', email: 'manual-expiry@example.test', grants: [{ role: 'operator', scope: 'unit', unitId: A1 }] }, randomUUID()))
+    const first = await withActor(db, 'admin-a', A, (tx, actor) => issueManualActivation(tx, actor, invite.userId, randomUUID()))
+    const second = await withActor(db, 'admin-a', A, (tx, actor) => issueManualActivation(tx, actor, invite.userId, randomUUID()))
+    await expect(activateAccount(db, { ...first, password }, randomUUID())).rejects.toThrow()
+    const email = await withActor(db, 'admin-a', A, (tx, actor) => resendInvitation(tx, actor, invite.userId, randomUUID()))
+    await expect(activateAccount(db, { ...second, password }, randomUUID())).rejects.toThrow()
+    const latest = await withActor(db, 'admin-a', A, (tx, actor) => issueManualActivation(tx, actor, invite.userId, randomUUID()))
+    await expect(activateAccount(db, { userId: email.userId, token: email.token, password }, randomUUID())).rejects.toThrow()
+    await pg.query("UPDATE auth_verification SET expires_at=now()-interval '1 minute' WHERE identifier=$1", ['enginedes.activation.manual.' + invite.userId])
+    await expect(activateAccount(db, { ...latest, password }, randomUUID())).rejects.toThrow()
   })
 
   it('[IAM-001/002][AUDIT-001] last admin, cross-tenant targets and invalid grant escalation are protected', async () => {

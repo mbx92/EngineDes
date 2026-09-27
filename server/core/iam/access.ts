@@ -1,12 +1,12 @@
 // MBX-5 / IAM-001/002, ORG-002, NFR-SEC-001/002. Grants preserve role/scope pairing.
 export type Role = 'admin' | 'director' | 'finance' | 'unit_manager' | 'operator' | 'supervisor'
-export type Permission = 'unit.read' | 'unit.create' | 'account.revoke' | 'account.read' | 'account.create' | 'account.manage' | 'organization.update'
+export type Permission = 'unit.read' | 'unit.create' | 'account.revoke' | 'account.read' | 'account.create' | 'account.manage' | 'account.activation_link' | 'organization.update'
 export type Grant = { role: Role; scope: 'tenant' | 'unit'; unitId: string | null }
 export interface ActorAccess { userId: string; tenantId: string; membershipId: string; grants: Grant[] }
 
 export class AccessDenied extends Error {}
 const permissions: Record<Role, readonly Permission[]> = {
-  admin: ['unit.read', 'unit.create', 'account.revoke', 'account.read', 'account.create', 'account.manage', 'organization.update'],
+  admin: ['unit.read', 'unit.create', 'account.revoke', 'account.read', 'account.create', 'account.manage', 'account.activation_link', 'organization.update'],
   director: ['unit.read'], finance: ['unit.read'], unit_manager: ['unit.read'],
   operator: ['unit.read'], supervisor: ['unit.read'],
 }

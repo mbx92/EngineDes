@@ -13,7 +13,7 @@ const grantInput = z.object({ role: z.enum(roleNames), scope: z.enum(['tenant', 
 export const grantsInput = z.array(grantInput).min(1).max(30).refine(grants => new Set(grants.map(g => JSON.stringify(g))).size === grants.length, 'Duplicate grants')
 export const newUserInput = z.object({ name: z.string().trim().min(1).max(160), email: z.email().max(254).transform(v => v.toLowerCase()), grants: grantsInput }).strict()
 const targetInput = z.string().min(1).max(128)
-const identifier = (userId: string) => 'enginedes.activation.' + userId
+export const activationIdentifier = (userId: string, method: 'email' | 'manual' = 'email') => 'enginedes.activation.' + (method === 'manual' ? 'manual.' : '') + userId
 export const hashActivationToken = (token: string) => createHash('sha256').update(token).digest('hex')
 
 export async function lockAdministration(tx: Transaction, actor: ActorAccess, permission: Permission = 'account.manage') {
@@ -44,11 +44,11 @@ async function keepAdministrator(tx: Transaction, tenantId: string) {
     .where(and(eq(memberships.tenantId, tenantId), eq(memberships.active, true), eq(memberships.pending, false), eq(roleGrants.role, 'admin'), eq(roleGrants.scope, 'tenant'))).limit(1)
   if (!found.length) throw new ManagementConflict('BUMDes harus memiliki minimal satu admin aktif.')
 }
-async function issueInvitation(tx: Transaction, userId: string, email: string) {
+async function issueInvitation(tx: Transaction, userId: string, email: string, method: 'email' | 'manual' = 'email') {
   const token = randomBytes(32).toString('base64url')
-  await tx.delete(verification).where(eq(verification.identifier, identifier(userId)))
-  await tx.insert(verification).values({ id: randomUUID(), identifier: identifier(userId), value: hashActivationToken(token), expiresAt: new Date(Date.now() + 86400000) })
-  // Internal delivery payload only. HTTP handlers must never expose this token to administrators.
+  await tx.delete(verification).where(inArray(verification.identifier, [activationIdentifier(userId), activationIdentifier(userId, 'manual')]))
+  await tx.insert(verification).values({ id: randomUUID(), identifier: activationIdentifier(userId, method), value: hashActivationToken(token), expiresAt: new Date(Date.now() + 86400000) })
+  // Only the dedicated, audited admin-link handler may expose a manual delivery link.
   return { userId, email, token }
 }
 export async function listUsers(tx: Transaction, actor: ActorAccess, query: unknown) {
@@ -83,6 +83,17 @@ export async function resendInvitation(tx: Transaction, actor: ActorAccess, targ
   const delivery = await issueInvitation(tx, target.userId, identity.email)
   await audit(tx, actor, 'account.invitation_reissued', targetId, requestId, null, { expiresInHours: 24 })
   return delivery
+}
+// IAM-001/002, AUDIT-001: bypass SMTP delivery only; the recipient still activates.
+export async function issueManualActivation(tx: Transaction, actor: ActorAccess, targetId: string, requestId: string) {
+  await lockAdministration(tx, actor, 'account.activation_link')
+  const target = await targetMember(tx, actor, targetId)
+  if (!target.pending || target.active) throw new ManagementConflict('Akun tidak sedang menunggu aktivasi.')
+  const [identity] = await tx.select({ email: user.email }).from(user).where(eq(user.id, target.userId))
+  if (!identity) throw new AccessDenied('Identity missing')
+  const delivery = await issueInvitation(tx, target.userId, identity.email, 'manual')
+  await audit(tx, actor, 'account.activation_link_issued', targetId, requestId, null, { delivery: 'manual', expiresInHours: 24 })
+  return { userId: delivery.userId, token: delivery.token }
 }
 export async function updateGrants(tx: Transaction, actor: ActorAccess, targetId: string, input: unknown, requestId: string) {
   const { grants } = z.object({ grants: grantsInput }).strict().parse(input)
