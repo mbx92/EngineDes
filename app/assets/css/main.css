@@ -451,32 +451,8 @@ input::placeholder{
   background:#0b876c;
   color:white
 }
-.sidebar-note{
-  margin:auto 5px 28px;
-  padding:17px;
-  border:1px solid #ffffff0e;
-  border-radius:10px;
-  background:linear-gradient(135deg,#ffffff04,#ffffff00)
-}
-.note-icon{
-  display:inline-flex;
-  color:#6dcdb1;
-  margin-bottom:10px
-}
-.sidebar-note strong{
-  display:block;
-  color:#cedae7;
-  font-size:11px;
-  font-weight:500;
-  line-height:1.6
-}
-.sidebar-note p{
-  font-size:10px;
-  line-height:1.8;
-  color:#7d91a7;
-  margin:8px 0 0
-}
 .sidebar-profile{
+  margin-top:auto;
   display:flex;
   align-items:center;
   gap:10px;
