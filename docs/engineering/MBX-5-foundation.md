@@ -16,6 +16,12 @@ Execution: [MBX-5](https://linear.app/mbx92/issue/MBX-5/phase-1-foundation-organ
 - App role has no ownership, superuser or BYPASSRLS privilege. Application startup rejects privileged/owner credentials. Audit rows are append-only for the app role.
 - JSON logs carry server-generated request ID, available verified tenant/actor and build identity. They exclude headers/body/query and are separate from persisted audit.
 
+## Dashboard UI
+
+The dashboard has Ringkasan and Unit Usaha views, verified-session profile/roles, responsive navigation, scoped Unit status cards and a searchable/filterable Unit table. Search, status filtering and counts apply only to the currently loaded page (50 rows); they are not organization-wide totals. No financial/reporting values are fabricated. Unit creation uses the existing authorized/audited endpoint through a native modal dialog. Failed list refresh after a successful create reports the successful write rather than encouraging duplicate submission. The initial UI still uses native HTML, Vue and Tailwind, with local SVG icons; no component library or external assets were added.
+
+Browser QA: login, navigation, unmatched search/reset, inactive filter/reset, modal open/cancel and mobile navigation. Unit creation remains covered by Core/API tests; UI inspection does not create sample business data.
+
 ## Environment and database setup
 
 Copy `.env.example` locally; never commit credentials. Provide `DATABASE_URL`, `MIGRATION_DATABASE_URL`, `BETTER_AUTH_URL` and a cryptographically random `BETTER_AUTH_SECRET` of at least 32 characters. Set the exact browser origin; mutating Core endpoints reject missing/foreign Origin.

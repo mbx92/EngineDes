@@ -4,14 +4,22 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
+import { createServer } from 'node:net'
 
 // MBX-5: verify the production artifact cannot rely on workspace node_modules.
 const root = await mkdtemp(join(tmpdir(), 'enginedes-artifact-'))
 let child
 try {
   await cp(resolve('.output'), join(root, '.output'), { recursive: true })
+  // Nitro treats PORT=0 as its default 3000; reserve an available port for this smoke run.
+  const probe = createServer()
+  await new Promise((resolve, reject) => { probe.once('error', reject); probe.listen(0, '127.0.0.1', resolve) })
+  const address = probe.address()
+  assert.ok(address && typeof address !== 'string')
+  const port = String(address.port)
+  await new Promise((resolve, reject) => probe.close(error => error ? reject(error) : resolve()))
   child = spawn(process.execPath, ['.output/server/index.mjs'], {
-    cwd: root, windowsHide: true, env: { ...process.env, HOST: '127.0.0.1', PORT: '0', NODE_ENV: 'production' },
+    cwd: root, windowsHide: true, env: { ...process.env, HOST: '127.0.0.1', NITRO_HOST: '127.0.0.1', PORT: port, NITRO_PORT: port, NODE_ENV: 'production' },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   let output = '', errors = ''
