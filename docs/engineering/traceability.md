@@ -12,8 +12,8 @@ Branch examples:
 PR title:
 `[MBX-10][PROC-004] Vendor Comparison`
 
-Commit messages should include the Linear issue when practical:
-`feat(procurement): add quotation comparison [MBX-10]`
+Use Conventional Commits with the Linear issue and affected requirement IDs:
+`feat(procurement): add quotation comparison [MBX-10][PROC-004]`
 
 ## Pull request evidence
 Every implementation PR should state:
