@@ -1,5 +1,12 @@
 import tailwindcss from '@tailwindcss/vite'
-import { builtinModules } from 'node:module'
+import { builtinModules, createRequire } from 'node:module'
+import { dirname, join } from 'node:path'
+
+// [MBX-5][NFR-MNT-002] Nitro 2 requires Hookable 5's always-Promise hooks.
+// Hoisted dev imports otherwise resolve Nuxt's Hookable 6 at the workspace root.
+const require = createRequire(import.meta.url)
+const nitroRequire = createRequire(require.resolve('nitropack/package.json'))
+const nitroHookable = join(dirname(nitroRequire.resolve('hookable')), 'index.mjs')
 
 export default defineNuxtConfig({
   compatibilityDate: '2026-09-27',
@@ -8,6 +15,7 @@ export default defineNuxtConfig({
   css: ['~/assets/css/main.css'],
   vite: { plugins: [tailwindcss()], server: { watch: { usePolling: true, interval: 300 } } },
   nitro: {
+    alias: { hookable: nitroHookable },
     preset: 'node-server',
     watchOptions: { usePolling: true, interval: 300 },
     // Bundle JS dependencies so the artifact works on exFAT and inside a standalone container.
