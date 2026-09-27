@@ -1,0 +1,50 @@
+{
+  "name": "enginedes",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.32.1",
+  "engines": {
+    "node": ">=22.19.0 <23"
+  },
+  "scripts": {
+    "dev": "nuxt dev --host 127.0.0.1 --port 3000",
+    "build": "nuxt build",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare",
+    "typecheck": "nuxt typecheck && tsc -p tsconfig.tooling.json",
+    "test": "vitest run",
+    "test:artifact": "node scripts/smoke-artifact.mjs",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "db:bootstrap": "tsx scripts/bootstrap.ts"
+  },
+  "dependencies": {
+    "@better-auth/drizzle-adapter": "1.7.6",
+    "@opentelemetry/api": "1.9.1",
+    "@tailwindcss/vite": "4.3.3",
+    "better-auth": "1.7.6",
+    "drizzle-orm": "0.45.3",
+    "h3": "1.15.11",
+    "nodemailer": "10.0.11",
+    "nuxt": "4.5.2",
+    "pino": "10.3.1",
+    "postgres": "3.4.9",
+    "tailwindcss": "4.3.3",
+    "vue": "3.5.43",
+    "vue-router": "5.3.1",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.8",
+    "@nuxt/test-utils": "4.3.2",
+    "@types/node": "22.20.4",
+    "@types/nodemailer": "8.0.2",
+    "drizzle-kit": "0.31.11",
+    "happy-dom": "20.14.5",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "vitest": "4.1.11",
+    "vue-tsc": "3.3.11"
+  }
+}

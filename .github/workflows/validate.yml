@@ -1,0 +1,46 @@
+name: Validate EngineDes
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  foundation:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: enginedes_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: isolated-ci-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d enginedes_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - name: Provision restricted runtime role for concurrency tests
+        run: |
+          node --input-type=module <<'JS'
+          import postgres from 'postgres'
+          const connection = postgres(process.env.TEST_DATABASE_URL, { max: 1 })
+          try { await connection.unsafe("CREATE ROLE enginedes_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD 'isolated-ci-runtime-only'") }
+          finally { await connection.end() }
+          JS
+        env:
+          TEST_DATABASE_URL: postgres://postgres:isolated-ci-test-only@localhost:5432/enginedes_test
+      - run: pnpm test
+        env:
+          TEST_DATABASE_URL: postgres://postgres:isolated-ci-test-only@localhost:5432/enginedes_test
+          TEST_RUNTIME_DATABASE_URL: postgres://enginedes_app:isolated-ci-runtime-only@localhost:5432/enginedes_test
+      - run: pnpm build
+      - run: pnpm test:artifact

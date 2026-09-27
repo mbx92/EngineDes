@@ -1,0 +1,10 @@
+node_modules/
+.nuxt/
+.output/
+.pnpm-store/
+.env
+.env.*
+!.env.example
+coverage/
+*.log
+.pnpm-patches/
