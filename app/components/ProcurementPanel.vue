@@ -65,7 +65,12 @@ const quotationTotal = computed(() => quotationForm.value.lines.reduce((sum, lin
 // [MBX-10][PROC-004] Comparison cells are keyed by (vendor, item); keeping the lookup here avoids
 // repeating it four times per cell in the template.
 const offerFor = (vendor: ComparisonVendor, itemId: string) => vendor.offers.find(offer => offer.itemId === itemId)
-const offerQty = (itemId: string) => comparison.value?.vendors.map(vendor => offerFor(vendor, itemId)?.quantity).find(value => value) || '—'
+// [MBX-10][PROC-004] The compared quantity is the one the vendors quoted, so it is shown with the
+// item's uom: a bare number would not say what is being compared.
+function offerQuantityLabel(item: Comparison['items'][number]) {
+  const quantity = comparison.value?.vendors.map(vendor => offerFor(vendor, item.itemId)?.quantity).find(value => value)
+  return quantity ? `${quantity} ${item.uom}` : '—'
+}
 
 function navigateTabs(event: KeyboardEvent) {
   const index = tabs.value.indexOf(activeTab.value)
@@ -174,7 +179,7 @@ onMounted(load)
 <template>
   <section class="procurement-page" :aria-busy="busy">
     <div class="procurement-overview">
-      <div><span class="eyebrow muted">PENGADAAN BUMDES</span><h2>Pengadaan &amp; Penawaran Vendor</h2><p>Ajukan permintaan pembelian, undang vendor lewat RFQ, lalu catat penawaran harga per item. Persetujuan dan Purchase Order menyusul pada tahap berikutnya.</p></div>
+      <div><span class="eyebrow muted">PENGADAAN BUMDES</span><h2>Pengadaan &amp; Penawaran Vendor</h2><p>Satu alur dari kebutuhan unit sampai perbandingan harga: catat permintaan, undang vendor lewat RFQ, lalu bandingkan penawaran secara setara. Persetujuan dan Purchase Order menyusul pada tahap berikutnya.</p></div>
       <div class="procurement-summary" aria-label="Ringkasan pengadaan"><div><strong>{{ requests.length }}</strong><span>Permintaan</span></div><div><strong>{{ rfqs.length }}</strong><span>RFQ</span></div><div><strong>{{ quotations.length }}</strong><span>Penawaran</span></div><div><strong>{{ items.length }}</strong><span>Item &amp; jasa</span></div></div>
     </div>
     <p v-if="message" :class="['notice', success ? 'success' : 'error']" :role="success ? 'status' : 'alert'">{{ message }}</p>
@@ -189,8 +194,8 @@ onMounted(load)
     <div v-show="activeTab === 'requests'" :id="`${tabId}-requests-panel`" class="procurement-layout" role="tabpanel" :aria-labelledby="`${tabId}-requests-tab`" tabindex="0">
       <section class="panel procurement-main-card">
         <div class="panel-heading"><div><h2>Permintaan pembelian</h2><p>Setiap permintaan menyimpan Unit, item/jasa, kuantitas, alasan, dan statusnya.</p></div><span class="count-badge">{{ requests.length }} permintaan</span></div>
-        <div v-if="!requests.length" class="empty-state"><h3>Belum ada permintaan</h3><p>Buat permintaan pembelian pada panel di samping.</p></div>
-        <div v-else class="table-scroll"><table><thead><tr><th>Nomor</th><th>Unit</th><th>Tanggal</th><th>Alasan</th><th class="number-column">Baris</th><th>Status</th><th v-if="canCreateRequest">Tindakan</th></tr></thead><tbody><tr v-for="request in requests" :key="request.id"><td><span class="document-id" :title="request.id">{{ request.number }}</span></td><td>{{ unitName(request.unitId) }}</td><td>{{ request.bookDate }}</td><td>{{ request.justification }}</td><td class="number-column">{{ request.lines.length }}</td><td><span :class="['status-pill', request.status === 'submitted' ? 'active' : 'inactive']">{{ statusLabels[request.status] || request.status }}</span></td><td v-if="canCreateRequest"><button type="button" class="link-button" :disabled="busy || request.status !== 'draft'" @click="submitRequest(request.id)">{{ request.status === 'draft' ? 'Ajukan' : 'Sudah diajukan' }}</button></td></tr></tbody></table></div>
+        <div v-if="!requests.length" class="empty-state"><AppIcon name="check" :size="30" /><h3>Belum ada permintaan</h3><p>Permintaan pembelian mencatat kebutuhan Unit: item atau jasa, jumlah, dan alasannya.</p></div>
+        <div v-else class="table-scroll"><table><thead><tr><th scope="col">Nomor</th><th scope="col">Unit</th><th scope="col">Tanggal</th><th scope="col">Alasan</th><th scope="col" class="number-column">Baris</th><th scope="col">Status</th><th v-if="canCreateRequest" scope="col">Tindakan</th></tr></thead><tbody><tr v-for="request in requests" :key="request.id"><td><span class="document-id" :title="request.id">{{ request.number }}</span></td><td>{{ unitName(request.unitId) }}</td><td>{{ request.bookDate }}</td><td>{{ request.justification }}</td><td class="number-column">{{ request.lines.length }}</td><td><span :class="['status-pill', request.status === 'submitted' ? 'active' : 'inactive']">{{ statusLabels[request.status] || request.status }}</span></td><td v-if="canCreateRequest"><button type="button" class="link-button" :disabled="busy || request.status !== 'draft'" @click="submitRequest(request.id)">{{ request.status === 'draft' ? 'Ajukan' : 'Sudah diajukan' }}</button></td></tr></tbody></table></div>
       </section>
       <aside v-if="canCreateRequest" class="procurement-actions">
         <div class="panel procurement-action-card"><span class="action-icon"><AppIcon name="plus" :size="18" /></span><h3>Buat permintaan</h3><p>Permintaan berhenti pada status diajukan; persetujuan ditangani pada tahap berikutnya.</p>
@@ -214,7 +219,7 @@ onMounted(load)
       <section class="panel procurement-main-card">
         <div class="panel-heading"><div><h2>RFQ vendor</h2><p>Satu RFQ dapat ditujukan ke beberapa vendor sekaligus.</p></div><span class="count-badge">{{ rfqs.length }} RFQ</span></div>
         <div v-if="!rfqs.length" class="empty-state"><h3>Belum ada RFQ</h3><p>RFQ dibuat dari permintaan pembelian yang sudah diajukan.</p></div>
-        <div v-else class="table-scroll"><table><thead><tr><th>Nomor</th><th>Permintaan</th><th>Unit</th><th>Tanggal</th><th class="number-column">Vendor diundang</th><th>Catatan</th></tr></thead><tbody><tr v-for="rfq in rfqs" :key="rfq.id"><td><span class="document-id" :title="rfq.id">{{ rfq.number }}</span></td><td>{{ requests.find(row => row.id === rfq.purchaseRequestId)?.number || '—' }}</td><td>{{ unitName(rfq.unitId) }}</td><td>{{ rfq.bookDate }}</td><td class="number-column">{{ rfq.vendorIds.length }}</td><td>{{ rfq.note || '—' }}</td></tr></tbody></table></div>
+        <div v-else class="table-scroll"><table><thead><tr><th scope="col">Nomor</th><th scope="col">Permintaan</th><th scope="col">Unit</th><th scope="col">Tanggal</th><th scope="col" class="number-column">Vendor diundang</th><th scope="col">Catatan</th></tr></thead><tbody><tr v-for="rfq in rfqs" :key="rfq.id"><td><span class="document-id" :title="rfq.id">{{ rfq.number }}</span></td><td>{{ requests.find(row => row.id === rfq.purchaseRequestId)?.number || '—' }}</td><td>{{ unitName(rfq.unitId) }}</td><td>{{ rfq.bookDate }}</td><td class="number-column">{{ rfq.vendorIds.length }}</td><td>{{ rfq.note || '—' }}</td></tr></tbody></table></div>
       </section>
       <aside v-if="canManageRfq" class="procurement-actions">
         <div class="panel procurement-action-card"><span class="action-icon"><AppIcon name="cart" :size="18" /></span><h3>Buat RFQ</h3><p>Pilih permintaan yang sudah diajukan, lalu undang vendor pada Unit yang sama.</p>
@@ -233,7 +238,7 @@ onMounted(load)
       <section class="panel procurement-main-card">
         <div class="panel-heading"><div><h2>Penawaran vendor</h2><p>Harga disimpan per vendor dan per item, beserta termin pembayaran dan waktu pengiriman.</p></div><span class="count-badge">{{ quotations.length }} penawaran</span></div>
         <div v-if="!quotations.length" class="empty-state"><h3>Belum ada penawaran</h3><p>Catat penawaran dari vendor yang sudah diundang pada sebuah RFQ.</p></div>
-        <div v-else class="table-scroll"><table><thead><tr><th>Nomor</th><th>RFQ</th><th>Vendor</th><th>Revisi</th><th>Termin</th><th class="number-column">Kirim (hari)</th><th class="number-column">Total (Rp)</th><th v-if="canQuote">Tindakan</th></tr></thead><tbody><tr v-for="quotation in quotations" :key="quotation.id"><td><span class="document-id" :title="quotation.id">{{ quotation.number }}</span></td><td>{{ rfqs.find(row => row.id === quotation.rfqId)?.number || '—' }}</td><td><strong>{{ partyName(quotation.partyId) }}</strong></td><td><span class="revision-badge">rev {{ quotation.revision }}</span></td><td>{{ quotation.paymentTerm || '—' }}</td><td class="number-column">{{ quotation.deliveryDays ?? '—' }}</td><td class="number-column"><strong>{{ idr(quotation.total) }}</strong></td><td v-if="canQuote"><button type="button" class="link-button" :disabled="busy" @click="revise(quotation)">Revisi</button></td></tr></tbody></table></div>
+        <div v-else class="table-scroll"><table><thead><tr><th scope="col">Nomor</th><th scope="col">RFQ</th><th scope="col">Vendor</th><th scope="col">Revisi</th><th scope="col">Termin</th><th scope="col" class="number-column">Kirim (hari)</th><th scope="col" class="number-column">Total (Rp)</th><th v-if="canQuote" scope="col">Tindakan</th></tr></thead><tbody><tr v-for="quotation in quotations" :key="quotation.id"><td><span class="document-id" :title="quotation.id">{{ quotation.number }}</span></td><td>{{ rfqs.find(row => row.id === quotation.rfqId)?.number || '—' }}</td><td><strong>{{ partyName(quotation.partyId) }}</strong></td><td><span class="revision-badge">rev {{ quotation.revision }}</span></td><td>{{ quotation.paymentTerm || '—' }}</td><td class="number-column">{{ quotation.deliveryDays ?? '—' }}</td><td class="number-column"><strong>{{ idr(quotation.total) }}</strong></td><td v-if="canQuote"><button type="button" class="link-button" :disabled="busy" @click="revise(quotation)">Revisi</button></td></tr></tbody></table></div>
       </section>
       <aside v-if="canQuote" class="procurement-actions">
         <div class="panel procurement-action-card"><span class="action-icon"><AppIcon name="layers" :size="18" /></span><h3>{{ quotationForm.supersedesId ? 'Revisi penawaran' : 'Catat penawaran' }}</h3><p>Revisi tidak menimpa harga lama: sistem menyimpan versi baru yang menunjuk penawaran sebelumnya.</p>
@@ -269,36 +274,40 @@ onMounted(load)
             <div><strong>{{ comparison.summary.lowestTotal ? 'Rp ' + idr(comparison.summary.lowestTotal) : '—' }}</strong><span>Total terendah</span></div>
             <div><strong>{{ comparison.summary.hasHistoricalPrices ? 'Ada' : 'Belum ada' }}</strong><span>Riwayat harga</span></div>
           </div>
-          <p v-if="comparison.purchaseRequest" class="hint">Dari permintaan <strong>{{ comparison.purchaseRequest.number }}</strong> · {{ comparison.purchaseRequest.justification }}</p>
+          <p v-if="comparison.purchaseRequest" class="hint comparison-source">Dari permintaan <strong>{{ comparison.purchaseRequest.number }}</strong> · {{ comparison.purchaseRequest.justification }}</p>
+          <!-- The anchor date makes "historical" auditable from the UI itself: only prices strictly
+               before this date can ever appear as history (PROC-004). -->
+          <p class="comparison-basis">Tiap vendor diwakili revisi terbarunya. Harga historis hanya dihitung dari penawaran <strong>sebelum {{ comparison.summary.historicalAnchorDate }}</strong>, bukan dari RFQ yang lebih baru.</p>
           <!-- [MBX-10][PROC-004] "Belum ada" is stated, never rendered as a zero or an empty column
-               that could be read as a price of nothing. -->
-          <p v-if="!comparison.summary.hasHistoricalPrices" class="comparison-note">Belum ada riwayat harga untuk vendor-vendor ini pada RFQ lain, jadi kolom harga historis dibiarkan kosong.</p>
+               that could be read as a price of nothing. The absence is declared once, here, instead
+               of repeating a placeholder in every cell of every vendor. -->
+          <p v-if="!comparison.summary.hasHistoricalPrices" class="comparison-note">Belum ada riwayat harga untuk vendor-vendor ini pada RFQ lain, jadi tiap sel hanya menampilkan harga penawaran saat ini. Harga historis muncul otomatis begitu ada penawaran pada RFQ yang lebih dahulu.</p>
           <div v-if="!comparison.vendors.length" class="empty-state"><h3>RFQ belum punya vendor</h3><p>Undang vendor pada RFQ ini terlebih dahulu.</p></div>
           <div v-else class="table-scroll"><table class="comparison-table">
-            <thead><tr><th class="comparison-sticky">Item</th><th class="number-column">Qty</th><th v-for="vendor in comparison.vendors" :key="vendor.partyId" class="number-column vendor-column"><span>{{ vendor.name }}</span><small v-if="!vendor.invited" class="muted">tidak diundang</small><small v-else-if="!vendor.quotation" class="muted">belum menawar</small><small v-else class="muted">rev {{ vendor.quotation.revision }} dari {{ vendor.quotation.revisionCount }}</small><small v-if="vendor.quotation" class="muted">kirim {{ vendor.quotation.deliveryDays ?? '—' }} hari · {{ vendor.quotation.paymentTerm || 'tanpa termin' }}</small></th></tr></thead>
+            <thead><tr><th class="comparison-sticky" scope="col">Item</th><th class="number-column" scope="col">Jumlah</th><th v-for="vendor in comparison.vendors" :key="vendor.partyId" scope="col" class="number-column vendor-column"><span class="vendor-name">{{ vendor.name }}</span><small v-if="!vendor.invited" class="vendor-state skipped">tidak diundang</small><small v-else-if="!vendor.quotation" class="vendor-state pending">belum menawar</small><small v-else class="vendor-state quoted">rev {{ vendor.quotation.revision }} dari {{ vendor.quotation.revisionCount }}</small><span v-if="vendor.quotation" class="vendor-meta">kirim {{ vendor.quotation.deliveryDays ?? '—' }} hari · {{ vendor.quotation.paymentTerm || 'tanpa termin' }}</span></th></tr></thead>
             <tbody>
               <tr v-for="item in comparison.items" :key="item.itemId">
                 <td class="comparison-sticky"><strong>{{ item.name }}</strong><small>{{ item.code }} · {{ item.uom }}</small></td>
-                <td class="number-column">{{ offerQty(item.itemId) }}</td>
+                <td class="number-column">{{ offerQuantityLabel(item) }}</td>
                 <td v-for="vendor in comparison.vendors" :key="vendor.partyId" class="number-column" :class="{ cheapest: item.cheapestPartyIds.includes(vendor.partyId) }">
                   <template v-if="offerFor(vendor, item.itemId)">
-                    <template v-if="offerFor(vendor, item.itemId)!.unitPrice">
-                      <span class="price">{{ idr(offerFor(vendor, item.itemId)!.unitPrice!) }}</span>
-                      <span v-if="item.cheapestPartyIds.includes(vendor.partyId)" class="cheapest-flag">termurah</span>
-                    </template>
+                    <span class="offer-line">
+                      <span class="price">{{ idr(offerFor(vendor, item.itemId)!.unitPrice ?? offerFor(vendor, item.itemId)!.amount!) }}</span>
+                      <span v-if="offerFor(vendor, item.itemId)!.mixedRate" class="cheapest-flag mixed">harga campuran</span>
+                      <span v-else-if="item.cheapestPartyIds.includes(vendor.partyId)" class="cheapest-flag">termurah</span>
+                    </span>
                     <!-- A mixed rate has no single price, so the cell shows the line total and says so
                          rather than presenting one of the two rates as if it were the whole quote. -->
-                    <template v-else><span class="price">{{ idr(offerFor(vendor, item.itemId)!.amount!) }}</span><span class="cheapest-flag mixed">harga campuran</span></template>
-                    <!-- [MBX-10][PROC-004] A prior price is shown only when it exists; otherwise the
-                         cell states that there is no history instead of implying one. -->
+                    <small v-if="offerFor(vendor, item.itemId)!.mixedRate" class="muted">beberapa tarif dalam satu penawaran</small>
+                    <!-- [MBX-10][PROC-004] A prior price is shown only when it exists; when it does
+                         not, the absence is already stated once above the table. -->
                     <small v-if="offerFor(vendor, item.itemId)!.historicalUnitPrice" class="history-line">sebelumnya {{ idr(offerFor(vendor, item.itemId)!.historicalUnitPrice!) }} ({{ offerFor(vendor, item.itemId)!.historicalBookDate }})<span :class="['delta', (offerFor(vendor, item.itemId)!.priceDeltaPct ?? 0) > 0 ? 'up' : (offerFor(vendor, item.itemId)!.priceDeltaPct ?? 0) < 0 ? 'down' : 'flat']">{{ (offerFor(vendor, item.itemId)!.priceDeltaPct ?? 0) > 0 ? '+' : '' }}{{ offerFor(vendor, item.itemId)!.priceDeltaPct ?? 0 }}%</span></small>
-                    <small v-else class="muted">tanpa riwayat harga</small>
                   </template>
                   <span v-else class="muted">—</span>
                 </td>
               </tr>
               <tr class="comparison-total"><td class="comparison-sticky"><strong>Total penawaran</strong></td><td></td>
-                <td v-for="vendor in comparison.vendors" :key="vendor.partyId" class="number-column" :class="{ cheapest: comparison.summary.lowestTotalPartyIds.includes(vendor.partyId) }"><strong v-if="vendor.total">{{ idr(vendor.total) }}</strong><span v-else class="muted">belum menawar</span><small v-if="vendor.itemsMissing" class="muted">{{ vendor.itemsMissing }} item belum dihargai</small></td>
+                <td v-for="vendor in comparison.vendors" :key="vendor.partyId" class="number-column" :class="{ cheapest: comparison.summary.lowestTotalPartyIds.includes(vendor.partyId) }"><strong v-if="vendor.total">Rp {{ idr(vendor.total) }}</strong><span v-else class="muted">belum menawar</span><small v-if="vendor.itemsMissing" class="muted">{{ vendor.itemsMissing }} item belum dihargai</small></td>
               </tr>
             </tbody>
           </table></div>
@@ -310,7 +319,7 @@ onMounted(load)
       <section class="panel procurement-main-card">
         <div class="panel-heading"><div><h2>Item &amp; jasa</h2><p>Item milik seluruh BUMDes bila Unit dikosongkan; item juga dapat dibatasi pada satu Unit.</p></div><span class="count-badge">{{ items.length }} item</span></div>
         <div v-if="!items.length" class="empty-state"><h3>Belum ada item</h3><p>Tambahkan item atau jasa agar dapat dipakai pada permintaan dan penawaran.</p></div>
-        <div v-else class="table-scroll"><table><thead><tr><th>Kode</th><th>Nama</th><th>Jenis</th><th>Satuan</th><th>Cakupan</th></tr></thead><tbody><tr v-for="item in items" :key="item.id"><td><span class="document-id">{{ item.code }}</span></td><td><strong>{{ item.name }}</strong></td><td>{{ kindLabels[item.kind] || item.kind }}</td><td>{{ item.uom }}</td><td>{{ item.unitId ? unitName(item.unitId) : 'Seluruh BUMDes' }}</td></tr></tbody></table></div>
+        <div v-else class="table-scroll"><table><thead><tr><th scope="col">Kode</th><th scope="col">Nama</th><th scope="col">Jenis</th><th scope="col">Satuan</th><th scope="col">Cakupan</th></tr></thead><tbody><tr v-for="item in items" :key="item.id"><td><span class="document-id">{{ item.code }}</span></td><td><strong>{{ item.name }}</strong></td><td>{{ kindLabels[item.kind] || item.kind }}</td><td>{{ item.uom }}</td><td>{{ item.unitId ? unitName(item.unitId) : 'Seluruh BUMDes' }}</td></tr></tbody></table></div>
       </section>
       <aside v-if="canManageItems" class="procurement-actions">
         <div class="panel procurement-action-card"><span class="action-icon"><AppIcon name="tag" :size="18" /></span><h3>Tambah item</h3><p>Master data menentukan apa yang dibandingkan antar vendor, sehingga harga historis tetap setara.</p>
@@ -329,7 +338,7 @@ onMounted(load)
 
 <style scoped>
 .procurement-page{display:grid;gap:18px}
-.procurement-overview{display:flex;align-items:center;justify-content:space-between;gap:28px;padding:22px 24px;border:1px solid #e2e9ee;border-radius:13px;background:linear-gradient(120deg,#fff 62%,#eef4fb)}
+.procurement-overview{display:flex;align-items:center;justify-content:space-between;gap:28px;padding:22px 24px;border:1px solid #e2e9ee;border-radius:13px;background:linear-gradient(120deg,#fff 62%,#f1f8f5)}
 .procurement-overview h2{font-size:21px;margin:5px 0 6px}
 .procurement-overview p{margin:0;color:#7d8998;font-size:12px;max-width:62ch}
 .procurement-summary{display:flex;align-items:center;gap:22px;flex-shrink:0}
@@ -339,22 +348,22 @@ onMounted(load)
 .procurement-tabs{display:flex;align-items:center;gap:24px;overflow-x:auto;border-bottom:1px solid #dbe2e9}
 .procurement-tabs>button{display:flex;align-items:center;gap:8px;padding:12px 0;border:0;border-bottom:2px solid transparent;background:transparent;color:#6b788b;font-size:13px;font-weight:500;white-space:nowrap}
 .procurement-tabs>button:hover:not(:disabled){color:#243146}
-.procurement-tabs>button[aria-selected="true"]{color:#2f6ea8;border-bottom-color:#2f6ea8}
-.procurement-tabs .procurement-reload{margin-left:auto;font-size:11px;color:#728094}
+.procurement-tabs>button[aria-selected="true"]{color:#07886d;border-bottom-color:#07886d}
+.procurement-tabs .procurement-reload{margin-left:auto;padding:12px 10px;font-size:11px;color:#728094}
 .procurement-filter{display:grid;grid-template-columns:repeat(1,minmax(150px,240px));gap:12px}
 .procurement-filter .field{margin:0}
 .procurement-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(290px,350px);gap:18px;align-items:start}
 .procurement-main-card{min-width:0}
 .procurement-actions{display:grid;gap:18px}
-.procurement-action-card{padding:22px}
+.procurement-action-card{padding:22px;position:sticky;top:20px}
 .procurement-action-card h3{font-size:16px;margin:14px 0 6px}
 .procurement-action-card>p{font-size:11px;line-height:1.7;color:#8491a1;margin:0 0 20px}
 .procurement-action-card form{display:grid;gap:14px}
 .procurement-action-card .field{margin:0}
 .procurement-submit{width:100%;justify-content:center;margin-top:4px}
-.action-icon{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border:1px solid #dbe6f2;border-radius:9px;background:#eef4fb;color:#2f6ea8}
+.action-icon{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border:1px solid #dcece6;border-radius:9px;background:#eef8f4;color:#19826d}
 .document-id{display:inline-flex;padding:4px 7px;border-radius:5px;background:#f1f4f7;color:#526176;font:600 10px ui-monospace,SFMono-Regular,Menlo,monospace}
-.revision-badge{display:inline-flex;padding:5px 8px;border-radius:999px;font-size:10px;font-weight:600;background:#eef4fb;color:#2f6ea8}
+.revision-badge{display:inline-flex;padding:5px 8px;border-radius:999px;font-size:10px;font-weight:600;background:#e8f5f0;color:#147863}
 .form-pair{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start}
 .line-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:4px;font-size:12px}
 .line-editor{display:grid;grid-template-columns:1fr 90px 32px;gap:10px;align-items:end}
@@ -363,7 +372,7 @@ onMounted(load)
 .vendor-picker{margin:0;padding:14px;border:1px solid #e2e9ee;border-radius:9px;display:grid;gap:9px}
 .vendor-picker legend{padding:0 6px;font-size:11px;font-weight:600;color:#6b788b;text-transform:uppercase;letter-spacing:.04em}
 .vendor-option{display:flex;align-items:center;gap:9px;font-size:12px;color:#3a4759}
-.vendor-option input{accent-color:#2f6ea8}
+.vendor-option input{accent-color:#07886d}
 .hint{margin:0;font-size:11px;color:#7d8998}
 .table-scroll{overflow-x:auto}
 .procurement-main-card table{width:100%;border-collapse:collapse;font-size:12px}
@@ -371,16 +380,23 @@ onMounted(load)
 .procurement-main-card td{padding:14px 16px;border-top:1px solid #edf1f4;color:#3a4759;vertical-align:middle}
 .procurement-main-card tbody tr:hover{background:#fbfcfc}
 .number-column{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-.link-button{border:0;background:transparent;color:#2f6ea8;font-size:11px;font-weight:600}
+.link-button{border:0;background:transparent;color:#07886d;font-size:11px;font-weight:600}
 .link-button:hover:not(:disabled){text-decoration:underline}
 .procurement-layout.single{grid-template-columns:minmax(0,1fr)}
 .comparison-picker{min-width:240px;margin:0}
-.comparison-summary{display:flex;flex-wrap:wrap;gap:22px;padding:16px 0}
+.comparison-summary{display:flex;flex-wrap:wrap;gap:22px;padding:16px 24px}
 .comparison-summary>div{display:grid;gap:2px;min-width:96px}
 .comparison-summary strong{font-size:16px;color:#243146}
 .comparison-summary span{font-size:10px;color:#8d99a8}
-.comparison-note{margin:0 0 14px;padding:11px 14px;border:1px solid #ecd9b4;border-radius:9px;background:#fdf7ea;color:#8a6d33;font-size:11px}
-.comparison-table th.vendor-column>span{display:block;font-size:11px;color:#526176;text-transform:none;letter-spacing:0}
+.comparison-source{padding:0 24px;margin-bottom:10px}
+.comparison-basis{padding:0 24px;margin:0 0 14px;font-size:11px;line-height:1.7;color:#7d8998}
+.comparison-note{margin:0 24px 16px;padding:11px 14px;border:1px solid #ecd9b4;border-radius:9px;background:#fdf7ea;color:#8a6d33;font-size:11px}
+.comparison-table th.vendor-column .vendor-name{display:block;font-size:11px;color:#354458;text-transform:none;letter-spacing:0;font-weight:700}
+.comparison-table th.vendor-column small.vendor-state{display:inline-flex;align-items:center;margin-top:5px;padding:3px 7px;border-radius:999px;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.vendor-state.quoted{background:#e8f5f0;color:#147863}
+.vendor-state.pending{background:#fff8e8;color:#a3833b}
+.vendor-state.skipped{background:#f1f4f7;color:#78859a}
+.comparison-table th.vendor-column .vendor-meta{display:block;margin-top:5px;font-size:10px;font-weight:400;color:#98a4b2;text-transform:none;letter-spacing:0}
 .comparison-table small{display:block;margin-top:3px;font-size:10px;font-weight:500}
 .comparison-table td.comparison-sticky small,.comparison-table th.comparison-sticky small{display:block;color:#8d99a8;font-weight:400}
 .comparison-table td.cheapest,.comparison-table tr.comparison-total td.cheapest{background:#eef7f1}
@@ -389,10 +405,15 @@ onMounted(load)
 .delta.up{color:#a8552f}
 .delta.down{color:#2f7a4f}
 .delta.flat{color:#78859a}
-.cheapest-flag{display:inline-flex;margin-top:4px;padding:3px 6px;border-radius:999px;background:#dbeee3;color:#2f7a4f;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.offer-line{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:6px}
+.comparison-table .price{font-size:12px;font-weight:600;color:#243146;font-variant-numeric:tabular-nums}
+.cheapest-flag{display:inline-flex;padding:3px 6px;border-radius:999px;background:#dbeee3;color:#2f7a4f;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.cheapest-flag.mixed{background:#fdf3e2;color:#96692a}
 .comparison-table .muted{color:#98a4b2}
 .comparison-table tr.comparison-total td{border-top:2px solid #e6ecf0;background:#f8fafb}
 .procurement-page [role="tabpanel"]:focus{outline:none}
-@media(max-width:1050px){.procurement-overview{align-items:flex-start;flex-direction:column}.procurement-summary{width:100%;flex-wrap:wrap}.procurement-layout{grid-template-columns:1fr}}
-@media(max-width:650px){.procurement-overview{padding:18px}.procurement-tabs{gap:18px}.procurement-tabs .procurement-reload{margin-left:0}.procurement-reload span{display:none}.form-pair,.line-editor,.quotation-line{grid-template-columns:1fr}.quotation-line .line-remove,.line-editor .line-remove{justify-self:start;margin-bottom:0}.procurement-action-card{padding:18px}.procurement-main-card table{min-width:680px}.comparison-picker{min-width:0;width:100%}.panel-heading{flex-direction:column;align-items:flex-start;gap:12px}}
+@media(max-width:1050px){.procurement-overview{align-items:flex-start;flex-direction:column}.procurement-summary{width:100%;flex-wrap:wrap}.procurement-layout{grid-template-columns:1fr}.procurement-action-card{position:static}}
+/* Keeps the comparison gutter identical to .panel-heading, which main.css narrows at 760px. */
+@media(max-width:760px){.comparison-summary{padding:16px 17px}.comparison-source,.comparison-basis{padding:0 17px}.comparison-note{margin:0 17px 16px}}
+@media(max-width:650px){.procurement-overview{padding:18px}.procurement-tabs{gap:18px}.procurement-tabs .procurement-reload{margin-left:auto;padding:10px 8px}.procurement-reload span{display:none}.form-pair,.line-editor,.quotation-line{grid-template-columns:1fr}.quotation-line .line-remove,.line-editor .line-remove{justify-self:start;margin-bottom:0}.procurement-action-card{padding:18px}.procurement-main-card table{min-width:680px}.comparison-picker{min-width:0;width:100%}.panel-heading{flex-direction:column;align-items:flex-start;gap:12px}}
 </style>
