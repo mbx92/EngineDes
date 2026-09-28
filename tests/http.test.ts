@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { setup, $fetch, fetch as fetchResponse } from '@nuxt/test-utils/e2e'
 
 describe('[MBX-5][IAM-001/002] Nuxt HTTP boundary', async () => {
-  await setup({ rootDir: fileURLToPath(new URL('..', import.meta.url)), browser: false, env: { BETTER_AUTH_URL: 'http://localhost:3000' } })
+  await setup({ rootDir: fileURLToPath(new URL('..', import.meta.url)), browser: false, env: { BETTER_AUTH_URL: 'http://localhost:3000', BETTER_AUTH_TRUSTED_ORIGINS: 'http://192.168.77.201:3000' } })
   it('serves the login page and liveness without database credentials', async () => {
     expect(await $fetch('/api/health')).toEqual({ status: 'ok' })
     expect(await $fetch('/api/auth/get-session')).toBeNull()
@@ -14,6 +14,8 @@ describe('[MBX-5][IAM-001/002] Nuxt HTTP boundary', async () => {
   })
   it('rejects missing/foreign Origin before any Unit mutation', async () => {
     await expect($fetch('/api/tenants/00000000-0000-4000-8000-000000000001/units', { method: 'POST', body: { name: 'Denied', code: 'X' } })).rejects.toMatchObject({ status: 403 })
+    await expect($fetch('/api/tenants/00000000-0000-4000-8000-000000000001/units', { method: 'POST', headers: { origin: 'http://evil.example:3000' }, body: {} })).rejects.toMatchObject({ status: 403 })
+    await expect($fetch('/api/tenants/00000000-0000-4000-8000-000000000001/units', { method: 'POST', headers: { origin: 'http://192.168.77.201:3000' }, body: {} })).rejects.toMatchObject({ status: 401 })
   })
   it('does not expose signup or account mutation bypass endpoints', async () => {
     await expect($fetch('/api/auth/sign-up/email', { method: 'POST', body: {} })).rejects.toMatchObject({ status: 404 })
