@@ -24,6 +24,7 @@ import { validateTransactionContext, requireApproval } from '../server/core/gove
 import { allocateNumber } from '../server/core/governance/numbering'
 import { seedDummy } from '../server/core/governance/demo'
 import { createLedgerAccount, setAccountingMapping, postBusinessEvent, closeAccountingPeriod, reverseJournal, adjustJournal, trialBalance, ledger } from '../server/core/accounting/engine'
+import { allocatePayment, createCashAccount, createFinancialDocument, createPayment, listCashAccounts, listFinancialDocuments, receivablesAging, voidFinancialDocument } from '../server/core/billing/billing'
 
 const A = '00000000-0000-4000-8000-000000000001', B = '00000000-0000-4000-8000-000000000002'
 const A1 = '00000000-0000-4000-8000-000000000011', A2 = '00000000-0000-4000-8000-000000000012', B1 = '00000000-0000-4000-8000-000000000021'
@@ -35,7 +36,15 @@ interface SQLHarness {
 }
 let pg: SQLHarness, db: Database, auth: ReturnType<typeof createAuth>
 const password = 'Local-test-passphrase-123!'
+// [MBX-8] Billing fixture identifiers, seeded in beforeAll under the privileged role.
+const BT='00000000-0000-4000-8000-000000000701', BU1='00000000-0000-4000-8000-000000000711', BU2='00000000-0000-4000-8000-000000000712'
+const BM='00000000-0000-4000-8000-000000000721', BMU='00000000-0000-4000-8000-000000000722'
 const rowsOf = (result: unknown): unknown[] => Array.isArray(result) ? result : (result as { rows: unknown[] }).rows
+// Database triggers are surfaced through drizzle's wrapped error, so assert on the cause.
+const dbRejection = async (run: () => Promise<unknown>, text: string) => {
+  try { await run() } catch (error) { expect(String((error as {cause?:Error}).cause || error)).toContain(text); return }
+  throw new Error('Expected database rejection containing: ' + text)
+}
 describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () => {
   beforeAll(async () => {
     const url = process.env.TEST_DATABASE_URL
@@ -70,6 +79,12 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
     await pg.query(`INSERT INTO memberships(id,tenant_id,user_id) VALUES ('00000000-0000-4000-8000-000000000104',$1,'finance-unit-a')`,[A])
     await pg.query(`INSERT INTO role_grants(tenant_id,membership_id,role,scope,unit_id) VALUES ($1,'00000000-0000-4000-8000-000000000104','finance','unit',$2)`,[A,A1])
     auth = createAuth(db, 'test-only-secret-not-a-production-secret-123456', 'http://localhost:3000')
+    // [MBX-8] Billing tenant seeded as the privileged role; configuration stays inside withActor.
+    await pg.query(`INSERT INTO tenants(id,name) VALUES ($1,'BUMDes Billing')`, [BT])
+    await pg.query(`INSERT INTO units(id,tenant_id,name,code) VALUES ($1,$3,'Toko Billing','BIL-1'),($2,$3,'Jasa Billing','BIL-2')`, [BU1, BU2, BT])
+    await pg.query(`INSERT INTO auth_user(id,name,email) VALUES ('billing-admin','Billing Admin','billing-admin@example.test'),('billing-unit','Billing Unit','billing-unit@example.test')`)
+    await pg.query(`INSERT INTO memberships(id,tenant_id,user_id) VALUES ($1,$3,'billing-admin'),($2,$3,'billing-unit')`, [BM, BMU, BT])
+    await pg.query(`INSERT INTO role_grants(tenant_id,membership_id,role,scope,unit_id) VALUES ($1,$2,'admin','tenant',NULL),($1,$3,'finance','unit',$4),($1,$2,'finance','tenant',NULL)`, [BT, BM, BMU, BU1])
   })
   beforeEach(async () => { await pg.exec('SET ROLE enginedes_app') })
   afterEach(async () => { await pg.exec('RESET ROLE') })
@@ -544,6 +559,103 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
     const exists=await withActor(db,'finance-a',A,tx=>tx.select().from(schema.journals).where(eq(schema.journals.eventId,eventId)))
     expect(exists).toHaveLength(0)
     await expect(withActor(db,'finance-a',A,tx=>tx.execute(sql`INSERT INTO journals(tenant_id,event_id,fingerprint,event_type,schema_version,book_date,kind,actor_id) VALUES (${B},${randomUUID()},'test','direct',1,'2026-10-08','normal','finance-a')`))).rejects.toThrow()
+  })
+
+  // ---------------------------------------------------------------------------------------
+  // [MBX-8] Cash, billing AR/AP and payment allocation.
+  // Only a server-backed PostgreSQL reaches these assertions, because the append-only and
+  // balance guards are database triggers that the PGlite WASM fallback cannot run faithfully.
+  // ---------------------------------------------------------------------------------------
+  it.runIf(!!process.env.TEST_DATABASE_URL)('[MBX-8][CASH-001][BILL-001..003][PAY-001..003] billing and money flow', async () => {
+    const tenant=BT, tenantUnit=BU1, tenantUnit2=BU2
+    const ledger=(code:string,kind:'asset'|'liability'|'revenue'|'expense')=>withActor(db,'billing-admin',tenant,(tx,a)=>createLedgerAccount(tx,a,{code,name:code,kind},randomUUID()))
+    const ar=(await ledger('1200-BIL','asset')).id, ap=(await ledger('2100-BIL','liability')).id
+    const revenue=(await ledger('4100-BIL','revenue')).id, expense=(await ledger('5100-BIL','expense')).id
+    const kasLedger=(await ledger('1110-BIL','asset')).id, bankLedger=(await ledger('1120-BIL','asset')).id
+    const rule=(accountId:string,side:'debit'|'credit')=>({accountId,side,amountKey:'total',unitDimension:'event_unit' as const})
+    const map=(eventType:string,rules:unknown[])=>withActor(db,'billing-admin',tenant,(tx,a)=>setAccountingMapping(tx,a,{eventType,schemaVersion:1,expectedRevision:0,rules},randomUUID()))
+    await map('invoice_issued',[rule(ar,'debit'),rule(revenue,'credit')])
+    await map('bill_received',[rule(expense,'debit'),rule(ap,'credit')])
+    await map('payment_received',[rule(ar,'credit'),rule(kasLedger,'debit')])
+    for (const type of ['invoice','bill','payment']) {
+      await withActor(db,'billing-admin',tenant,(tx,a)=>setConfiguration(tx,a,{key:'sequence:'+type,value:{prefix:type.toUpperCase(),scope:'unit',reset:'month'},expectedRevision:0},randomUUID()))
+    }
+    const party=(code:string,role:'customer'|'vendor',name:string)=>withActor(db,'billing-admin',tenant,(tx,a)=>saveParty(tx,a,undefined,{kind:'person',name,code,roles:[{role,unitId:tenantUnit}]},randomUUID()))
+    const customer=(await party('BIL-CUST','customer','Pelanggan Billing')).id
+    const vendor=(await party('BIL-VEND','vendor','Pemasok Billing')).id
+    const agingCustomer=(await party('BIL-AGING','customer','Pelanggan Aging')).id
+    const kas=(await withActor(db,'billing-admin',tenant,(tx,a)=>createCashAccount(tx,a,{unitId:tenantUnit,code:'KAS-BIL',name:'Kas Billing',kind:'cash',ledgerAccountId:kasLedger},randomUUID()))).id
+    await withActor(db,'billing-admin',tenant,(tx,a)=>createCashAccount(tx,a,{unitId:tenantUnit,code:'BANK-BIL',name:'Bank Billing',kind:'bank',ledgerAccountId:bankLedger},randomUUID()))
+    const invoice=(amount:string,bookDate:string,dueDate:string,partyId:string)=>withActor(db,'billing-unit',tenant,(tx,a)=>createFinancialDocument(tx,a,{type:'invoice',unitId:tenantUnit,locationId:null,partyId,bookDate,dueDate,amount,commandId:randomUUID()},randomUUID()))
+
+    // [CASH-001][IAM-002][CFG-001] more than one account; configuration stays with the admin
+    // role (as in Phase 2) while Finance only consumes configured accounts.
+    const accounts=await withActor(db,'billing-unit',tenant,(tx,a)=>listCashAccounts(tx,a,{unitId:tenantUnit}))
+    expect(accounts.map(row=>row.code).sort()).toEqual(['BANK-BIL','KAS-BIL'])
+    await expect(withActor(db,'billing-unit',tenant,(tx,a)=>createCashAccount(tx,a,{unitId:tenantUnit,code:'X',name:'X',kind:'cash',ledgerAccountId:ar},randomUUID()))).rejects.toThrow()
+    await expect(withActor(db,'billing-admin',tenant,(tx,a)=>createCashAccount(tx,a,{unitId:tenantUnit2,code:'BAD',name:'Bad',kind:'cash',ledgerAccountId:randomUUID()},randomUUID()))).rejects.toThrow('Ledger account unavailable')
+
+    // [BILL-003][PARTY-004] an AR document requires its Customer role; AP requires a Vendor.
+    await expect(withActor(db,'billing-unit',tenant,(tx,a)=>createFinancialDocument(tx,a,{type:'invoice',unitId:tenantUnit,locationId:null,partyId:vendor,bookDate:'2026-02-01',dueDate:'2026-03-01',amount:'100000',commandId:randomUUID()},randomUUID()))).rejects.toThrow('Customer Party not available')
+    await expect(withActor(db,'billing-unit',tenant,(tx,a)=>createFinancialDocument(tx,a,{type:'bill',unitId:tenantUnit,locationId:null,partyId:customer,bookDate:'2026-02-01',dueDate:'2026-03-01',amount:'100000',commandId:randomUUID()},randomUUID()))).rejects.toThrow('Vendor Party not available')
+    const billed=await withActor(db,'billing-unit',tenant,(tx,a)=>createFinancialDocument(tx,a,{type:'bill',unitId:tenantUnit,locationId:null,partyId:vendor,bookDate:'2026-02-01',dueDate:'2026-03-01',amount:'100000',commandId:randomUUID()},randomUUID()))
+    expect(billed).toMatchObject({ type:'bill', outstanding:100000n, status:'open' })
+
+    // [SEQ-001] a replayed command returns the same document with a single journal.
+    const replay={type:'invoice' as const,unitId:tenantUnit,locationId:null,partyId:customer,bookDate:'2026-02-02',dueDate:'2026-03-02',amount:'50000',commandId:randomUUID()}
+    const first=await withActor(db,'billing-unit',tenant,(tx,a)=>createFinancialDocument(tx,a,replay,randomUUID()))
+    expect((await withActor(db,'billing-unit',tenant,(tx,a)=>createFinancialDocument(tx,a,replay,randomUUID()))).id).toBe(first.id)
+    expect(await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.journals).where(eq(schema.journals.eventId,replay.commandId)))).toHaveLength(1)
+
+    // [BILL-002] aging buckets follow the accepted Phase 3 boundaries.
+    for (const [dueDate,amount] of [['2026-06-15','100000'],['2026-05-20','200000'],['2026-04-20','300000'],['2026-03-20','400000'],['2026-01-02','500000']] as const) {
+      await invoice(amount,'2026-01-02',dueDate,agingCustomer)
+    }
+    const aging=await withActor(db,'billing-unit',tenant,(tx,a)=>receivablesAging(tx,a,{asOf:'2026-06-15',type:'invoice',unitId:tenantUnit}))
+    const mine=new Map(aging.rows.filter(row=>row.party_id===agingCustomer).map(row=>[String(row.bucket),String(row.outstanding)]))
+    expect([mine.get('current'),mine.get('1-30'),mine.get('31-60'),mine.get('61-90'),mine.get('90+')]).toEqual(['100000','200000','300000','400000','500000'])
+    expect(Object.keys(aging.buckets)).toEqual(['current','1-30','31-60','61-90','90+'])
+
+    // [PAY-001][PAY-002] partial payment keeps the document open until the balance reaches zero.
+    const target=await invoice('100000','2026-02-03','2026-03-03',customer)
+    const payment=await withActor(db,'billing-unit',tenant,(tx,a)=>createPayment(tx,a,{direction:'in',unitId:tenantUnit,locationId:null,partyId:customer,cashAccountId:kas,bookDate:'2026-02-05',amount:'70000',commandId:randomUUID()},randomUUID()))
+    expect(await withActor(db,'billing-unit',tenant,(tx,a)=>allocatePayment(tx,a,{paymentId:payment.id,documentId:target.id,amount:'40000'},randomUUID()))).toMatchObject({outstanding:'60000',status:'open'})
+    await expect(withActor(db,'billing-unit',tenant,(tx,a)=>allocatePayment(tx,a,{paymentId:payment.id,documentId:target.id,amount:'70000'},randomUUID()))).rejects.toThrow()
+    const rest=await withActor(db,'billing-unit',tenant,(tx,a)=>createPayment(tx,a,{direction:'in',unitId:tenantUnit,locationId:null,partyId:customer,cashAccountId:kas,bookDate:'2026-02-06',amount:'60000',commandId:randomUUID()},randomUUID()))
+    expect(await withActor(db,'billing-unit',tenant,(tx,a)=>allocatePayment(tx,a,{paymentId:rest.id,documentId:target.id,amount:'60000'},randomUUID()))).toMatchObject({outstanding:'0',status:'paid'})
+    await expect(withActor(db,'billing-unit',tenant,(tx,a)=>allocatePayment(tx,a,{paymentId:payment.id,documentId:target.id,amount:'1000'},randomUUID()))).rejects.toThrow('tidak dalam status terbuka')
+    // RLS hides the other tenant's payment entirely, so the denial surfaces as "unavailable".
+    await expect(withActor(db,'user-b',B,(tx,a)=>allocatePayment(tx,a,{paymentId:payment.id,documentId:target.id,amount:'1'},randomUUID()))).rejects.toThrow('Payment unavailable')
+
+    // [PAY-003][AUDIT-001] void keeps actor/reason/reference and is refused once allocated.
+    const clean=await invoice('10000','2026-02-07','2026-03-07',customer)
+    expect(await withActor(db,'billing-unit',tenant,(tx,a)=>voidFinancialDocument(tx,a,{documentId:clean.id,reason:'Salah input',reference:'MEMO-9'},randomUUID()))).toMatchObject({status:'void',voidedBy:'billing-unit'})
+    const trail=await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.financialDocumentEvents).where(eq(schema.financialDocumentEvents.documentId,clean.id)))
+    expect(trail.map(row=>row.action)).toEqual(['created','voided'])
+    expect(trail.find(row=>row.action==='voided')).toMatchObject({actorId:'billing-unit',reason:'Salah input',reference:'MEMO-9'})
+    expect((await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.auditEvents).where(eq(schema.auditEvents.entityId,clean.id)))).some(row=>row.action==='financial_document.voided')).toBe(true)
+    await expect(withActor(db,'billing-unit',tenant,(tx,a)=>voidFinancialDocument(tx,a,{documentId:clean.id,reason:'again'},randomUUID()))).rejects.toThrow('sudah dibatalkan')
+    const partially=await invoice('10000','2026-02-08','2026-03-08',customer)
+    const small=await withActor(db,'billing-unit',tenant,(tx,a)=>createPayment(tx,a,{direction:'in',unitId:tenantUnit,locationId:null,partyId:customer,cashAccountId:kas,bookDate:'2026-02-08',amount:'5000',commandId:randomUUID()},randomUUID()))
+    await withActor(db,'billing-unit',tenant,(tx,a)=>allocatePayment(tx,a,{paymentId:small.id,documentId:partially.id,amount:'5000'},randomUUID()))
+    try {
+      await withActor(db,'billing-unit',tenant,(tx,a)=>voidFinancialDocument(tx,a,{documentId:partially.id,reason:'attempt'},randomUUID()))
+      throw new Error('Void of an allocated document unexpectedly succeeded')
+    } catch (error) {
+      expect(String((error as {cause?:Error}).cause || error)).toContain('Void is not permitted once allocations exist')
+    }
+
+    // [BILL-001][NFR-SEC-002] outstanding is stored, cannot increase, and cannot move by direct SQL.
+    const spare=await withActor(db,'billing-unit',tenant,(tx,a)=>createPayment(tx,a,{direction:'in',unitId:tenantUnit,locationId:null,partyId:customer,cashAccountId:kas,bookDate:'2026-02-09',amount:'100',commandId:randomUUID()},randomUUID()))
+    await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`INSERT INTO payment_allocations(tenant_id,payment_id,document_id,amount,actor_id) VALUES (${tenant},${spare.id},${target.id},1,'billing-unit')`)),'Document is not open')
+    await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`UPDATE financial_documents SET outstanding=outstanding+1 WHERE id=${partially.id}`)),'Outstanding changes only through payment allocation')
+    await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`UPDATE financial_documents SET amount=999 WHERE id=${partially.id}`)),'Document financial facts are immutable')
+    await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`UPDATE payments SET amount=999 WHERE id=${payment.id}`)),'Posted payment facts are immutable')
+    expect((await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.paymentAllocations).where(eq(schema.paymentAllocations.documentId,target.id)))).map(row=>row.amount.toString()).sort()).toEqual(['40000','60000'])
+
+    // [LOCK-001] a closed period in this tenant rejects new documents like any other posting.
+    await withActor(db,'billing-admin',tenant,(tx,a)=>closeAccountingPeriod(tx,a,'2026-07',randomUUID()))
+    await expect(invoice('5000','2026-07-10','2026-08-10',customer)).rejects.toThrow('ditutup')
   })
 
 })

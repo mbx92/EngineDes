@@ -64,6 +64,20 @@
       "when": 1790557800000,
       "tag": "0008_journal_guard",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1790564995816,
+      "tag": "0009_billing_isolation",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1790565000000,
+      "tag": "0010_billing_guard",
+      "breakpoints": true
     }
   ]
 }

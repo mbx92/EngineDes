@@ -138,3 +138,66 @@ export const auditEvents = pgTable('audit_events', {
   actorId: text('actor_id').notNull().references(() => user.id), action: text('action').notNull(),
   entityId: text('entity_id').notNull(), before: jsonb('before'), after: jsonb('after'), requestId: uuid('request_id').notNull(), createdAt: created(),
 })
+// [MBX-8][CASH-001] A cash/bank account is a tenant-owned operational entity bound to
+// exactly one existing ledger account. It is not a second ledger and holds no debit/credit rule.
+export const cashAccounts = pgTable('cash_accounts', {
+  id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
+  unitId: uuid('unit_id').notNull(), code: text('code').notNull(), name: text('name').notNull(),
+  kind: text('kind').notNull(), ledgerAccountId: uuid('ledger_account_id').notNull(),
+  active: boolean('active').notNull().default(true), createdAt: created(),
+}, t => [unique().on(t.tenantId,t.id), unique().on(t.tenantId,t.unitId,t.code),
+  foreignKey({columns:[t.tenantId,t.unitId],foreignColumns:[units.tenantId,units.id]}),
+  foreignKey({columns:[t.tenantId,t.ledgerAccountId],foreignColumns:[ledgerAccounts.tenantId,ledgerAccounts.id]}),
+  check('cash_account_kind',sql`${t.kind} IN ('cash','bank')`)])
+// [MBX-8][BILL-001..003] AR/AP document. Outstanding is stored, never derived at read time,
+// so concurrent allocation cannot silently oversell the same balance.
+export const financialDocuments = pgTable('financial_documents', {
+  id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
+  type: text('type').notNull(), number: text('number').notNull(), commandId: uuid('command_id').notNull(),
+  unitId: uuid('unit_id').notNull(), locationId: uuid('location_id'), partyId: uuid('party_id'),
+  bookDate: date('book_date',{mode:'string'}).notNull(), dueDate: date('due_date',{mode:'string'}).notNull(),
+  amount: bigint('amount',{mode:'bigint'}).notNull(), outstanding: bigint('outstanding',{mode:'bigint'}).notNull(),
+  status: text('status').notNull().default('open'),
+  voidedAt: timestamp('voided_at',{withTimezone:true}), voidedBy: text('voided_by').references(() => user.id), createdAt: created(),
+}, t => [unique().on(t.tenantId,t.id), unique().on(t.tenantId,t.type,t.commandId), unique().on(t.tenantId,t.number),
+  foreignKey({columns:[t.tenantId,t.unitId],foreignColumns:[units.tenantId,units.id]}),
+  foreignKey({columns:[t.tenantId,t.unitId,t.locationId],foreignColumns:[locations.tenantId,locations.unitId,locations.id]}),
+  foreignKey({columns:[t.tenantId,t.partyId],foreignColumns:[parties.tenantId,parties.id]}),
+  check('financial_document_type',sql`${t.type} IN ('invoice','bill')`),
+  check('financial_document_status',sql`${t.status} IN ('open','paid','void')`),
+  check('financial_document_amount',sql`${t.amount} > 0 AND ${t.outstanding} >= 0 AND ${t.outstanding} <= ${t.amount}`),
+  check('financial_document_due',sql`${t.dueDate} >= ${t.bookDate}`),
+  check('financial_document_void',sql`(${t.status} = 'void') = (${t.voidedBy} IS NOT NULL)`),
+  check('financial_document_state',sql`(${t.status} = 'open' AND ${t.outstanding} > 0) OR (${t.status} = 'paid' AND ${t.outstanding} = 0) OR (${t.status} = 'void')`)])
+// [MBX-8][PAY-003][AUDIT-001] Append-only status trail carrying actor, reason and reference.
+export const financialDocumentEvents = pgTable('financial_document_events', {
+  id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull(),
+  documentId: uuid('document_id').notNull(), action: text('action').notNull(),
+  actorId: text('actor_id').notNull().references(() => user.id), reason: text('reason'), reference: text('reference'), createdAt: created(),
+}, t => [foreignKey({columns:[t.tenantId,t.documentId],foreignColumns:[financialDocuments.tenantId,financialDocuments.id]}),
+  check('financial_document_event_action',sql`${t.action} IN ('created','allocated','paid','voided','refunded')`)])
+// [MBX-8][PAY-001..003] Money received/paid. Allocation is a separate append-only row so a
+// partial payment can leave both the document and the payment partially settled.
+export const payments = pgTable('payments', {
+  id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
+  direction: text('direction').notNull(), number: text('number').notNull(), commandId: uuid('command_id').notNull(),
+  unitId: uuid('unit_id').notNull(), locationId: uuid('location_id'), partyId: uuid('party_id').notNull(),
+  cashAccountId: uuid('cash_account_id').notNull(), bookDate: date('book_date',{mode:'string'}).notNull(),
+  amount: bigint('amount',{mode:'bigint'}).notNull(), allocated: bigint('allocated',{mode:'bigint'}).notNull(),
+  status: text('status').notNull().default('posted'), reason: text('reason'), reference: text('reference'), createdAt: created(),
+}, t => [unique().on(t.tenantId,t.id), unique().on(t.tenantId,t.commandId), unique().on(t.tenantId,t.number),
+  foreignKey({columns:[t.tenantId,t.unitId],foreignColumns:[units.tenantId,units.id]}),
+  foreignKey({columns:[t.tenantId,t.unitId,t.locationId],foreignColumns:[locations.tenantId,locations.unitId,locations.id]}),
+  foreignKey({columns:[t.tenantId,t.partyId],foreignColumns:[parties.tenantId,parties.id]}),
+  foreignKey({columns:[t.tenantId,t.cashAccountId],foreignColumns:[cashAccounts.tenantId,cashAccounts.id]}),
+  check('payment_direction',sql`${t.direction} IN ('in','out')`),
+  check('payment_status',sql`${t.status} IN ('posted','void')`),
+  check('payment_amount',sql`${t.amount} > 0 AND ${t.allocated} >= 0 AND ${t.allocated} <= ${t.amount}`)])
+export const paymentAllocations = pgTable('payment_allocations', {
+  id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull(),
+  paymentId: uuid('payment_id').notNull(), documentId: uuid('document_id').notNull(),
+  amount: bigint('amount',{mode:'bigint'}).notNull(), actorId: text('actor_id').notNull().references(() => user.id), createdAt: created(),
+}, t => [foreignKey({columns:[t.tenantId,t.paymentId],foreignColumns:[payments.tenantId,payments.id]}),
+  foreignKey({columns:[t.tenantId,t.documentId],foreignColumns:[financialDocuments.tenantId,financialDocuments.id]}),
+  unique().on(t.tenantId,t.paymentId,t.documentId),
+  check('payment_allocation_amount',sql`${t.amount} > 0`)])
