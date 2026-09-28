@@ -205,3 +205,17 @@ export const paymentAllocations = pgTable('payment_allocations', {
   foreignKey({columns:[t.tenantId,t.documentId],foreignColumns:[financialDocuments.tenantId,financialDocuments.id]}),
   unique().on(t.tenantId,t.paymentId,t.documentId),
   check('payment_allocation_amount',sql`${t.amount} > 0`)])
+// [MBX-8][PAY-003][BILL-001] A refund credits cash back and restores the document outstanding.
+// It is intentionally not a second allocation: payment_allocations stays the immutable record of
+// what was collected, and this append-only table records what was given back, bounded by the
+// collected amount so repeated refunds cannot exceed the allocation they correct.
+export const paymentRefunds = pgTable('payment_refunds', {
+  id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull(),
+  paymentId: uuid('payment_id').notNull(), documentId: uuid('document_id').notNull(),
+  amount: bigint('amount',{mode:'bigint'}).notNull(), commandId: uuid('command_id').notNull(),
+  bookDate: date('book_date',{mode:'string'}).notNull(), reason: text('reason').notNull(), reference: text('reference'),
+  actorId: text('actor_id').notNull().references(() => user.id), createdAt: created(),
+}, t => [foreignKey({columns:[t.tenantId,t.paymentId],foreignColumns:[payments.tenantId,payments.id]}),
+  foreignKey({columns:[t.tenantId,t.documentId],foreignColumns:[financialDocuments.tenantId,financialDocuments.id]}),
+  unique().on(t.tenantId,t.commandId),
+  check('payment_refund_amount',sql`${t.amount} > 0`)])

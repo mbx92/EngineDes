@@ -85,6 +85,13 @@
       "when": 1790576171940,
       "tag": "0011_common_pepper_potts",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1790578505865,
+      "tag": "0012_slim_harpoon",
+      "breakpoints": true
     }
   ]
 }

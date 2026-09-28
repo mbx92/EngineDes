@@ -24,7 +24,7 @@ import { validateTransactionContext, requireApproval } from '../server/core/gove
 import { allocateNumber } from '../server/core/governance/numbering'
 import { seedDummy } from '../server/core/governance/demo'
 import { createLedgerAccount, setAccountingMapping, postBusinessEvent, closeAccountingPeriod, reverseJournal, adjustJournal, trialBalance, ledger } from '../server/core/accounting/engine'
-import { allocatePayment, createCashAccount, createFinancialDocument, createPayment, listCashAccounts, listFinancialDocuments, listPayments, receivablesAging, voidFinancialDocument, voidPayment } from '../server/core/billing/billing'
+import { allocatePayment, createCashAccount, createFinancialDocument, createPayment, listAllocations, listCashAccounts, listFinancialDocuments, listPayments, listRefunds, receivablesAging, refundPayment, voidFinancialDocument, voidPayment } from '../server/core/billing/billing'
 
 const A = '00000000-0000-4000-8000-000000000001', B = '00000000-0000-4000-8000-000000000002'
 const A1 = '00000000-0000-4000-8000-000000000011', A2 = '00000000-0000-4000-8000-000000000012', B1 = '00000000-0000-4000-8000-000000000021'
@@ -409,8 +409,8 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
   })
   it('[ORG-001][PARTY-001][AUDIT-001] dummy seed is idempotent and leaves users pending without demo passwords', async () => {
     const first=await seedDummy(db,'admin-a',A),second=await seedDummy(db,'admin-a',A)
-    expect(first.created).toBe(32);expect(second.created).toBe(0)
-    expect(first.ledgerAccounts).toBe(5);expect(first.accountingMappings).toBe(5);expect(first.billingSequences).toBe(3)
+    expect(first.created).toBe(34);expect(second.created).toBe(0)
+    expect(first.ledgerAccounts).toBe(5);expect(first.accountingMappings).toBe(7);expect(first.billingSequences).toBe(3)
     expect(await withActor(db,'admin-a',A,tx=>tx.select().from(schema.journals))).toEqual([])
     const users=await withActor(db,'admin-a',A,tx=>tx.execute(sql`SELECT m.pending,m.active FROM memberships m JOIN auth_user u ON u.id=m.user_id WHERE u.email LIKE 'demo.%@example.test'`))
     const seededUsers=rowsOf(users) as {pending:boolean;active:boolean}[]
@@ -577,6 +577,10 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
     await map('invoice_issued',[rule(ar,'debit'),rule(revenue,'credit')])
     await map('bill_received',[rule(expense,'debit'),rule(ap,'credit')])
     await map('payment_received',[rule(ar,'credit'),rule(kasLedger,'debit')])
+    // [PAY-003] Refunds mirror the payment they correct: cash received is credited back against
+    // receivables, cash paid is debited back against payables. No clearing account is introduced.
+    await map('sales_refund',[rule(ar,'debit'),rule(kasLedger,'credit')])
+    await map('purchase_refund',[rule(kasLedger,'debit'),rule(ap,'credit')])
     for (const type of ['invoice','bill','payment']) {
       await withActor(db,'billing-admin',tenant,(tx,a)=>setConfiguration(tx,a,{key:'sequence:'+type,value:{prefix:type.toUpperCase(),scope:'unit',reset:'month'},expectedRevision:0},randomUUID()))
     }
@@ -678,7 +682,10 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
     // [BILL-001][NFR-SEC-002] outstanding is stored, cannot increase, and cannot move by direct SQL.
     const spare=await withActor(db,'billing-unit',tenant,(tx,a)=>createPayment(tx,a,{direction:'in',unitId:tenantUnit,locationId:null,partyId:customer,cashAccountId:kas,bookDate:'2026-02-09',amount:'100',commandId:randomUUID()},randomUUID()))
     await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`INSERT INTO payment_allocations(tenant_id,payment_id,document_id,amount,actor_id) VALUES (${tenant},${spare.id},${target.id},1,'billing-unit')`)),'Document is not open')
-    await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`UPDATE financial_documents SET outstanding=outstanding+1 WHERE id=${partially.id}`)),'Outstanding changes only through payment allocation')
+    // [PAY-003] Neither direction moves by direct SQL: only allocation may lower outstanding and
+    // only a refund may restore it.
+    await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`UPDATE financial_documents SET outstanding=outstanding-1, status='open' WHERE id=${partially.id}`)),'Outstanding changes only through payment allocation')
+    await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`UPDATE financial_documents SET outstanding=outstanding+1, status='open' WHERE id=${partially.id}`)),'Outstanding cannot increase')
     await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`UPDATE financial_documents SET amount=999 WHERE id=${partially.id}`)),'Document financial facts are immutable')
     await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`UPDATE payments SET amount=999 WHERE id=${payment.id}`)),'Posted payment facts are immutable')
     expect((await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.paymentAllocations).where(eq(schema.paymentAllocations.documentId,target.id)))).map(row=>row.amount.toString()).sort()).toEqual(['40000','60000'])
@@ -686,6 +693,47 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
     // [LOCK-001] a closed period in this tenant rejects new documents like any other posting.
     await withActor(db,'billing-admin',tenant,(tx,a)=>closeAccountingPeriod(tx,a,'2026-07',randomUUID()))
     await expect(invoice('5000','2026-07-10','2026-08-10',customer)).rejects.toThrow('ditutup')
+
+    // [PAY-003][BILL-001][MAP-001..004][AUDIT-001] refund credits cash back to the paying account
+    // and restores the document outstanding, bounded by what the payment collected there.
+    const refundDoc=await invoice('100000','2026-03-01','2026-04-01',customer)
+    const refundEvent=randomUUID()
+    const refundPay=await withActor(db,'billing-unit',tenant,(tx,a)=>createPayment(tx,a,{direction:'in',unitId:tenantUnit,locationId:null,partyId:customer,cashAccountId:kas,bookDate:'2026-03-02',amount:'60000',commandId:randomUUID()},randomUUID()))
+    await withActor(db,'billing-unit',tenant,(tx,a)=>allocatePayment(tx,a,{paymentId:refundPay.id,documentId:refundDoc.id,amount:'60000'},randomUUID()))
+    expect(await withActor(db,'billing-unit',tenant,(tx,a)=>refundPayment(tx,a,{paymentId:refundPay.id,documentId:refundDoc.id,amount:'25000',reason:'Barang dikembalikan',reference:'NOTA-7',eventId:refundEvent,bookDate:'2026-03-05'},randomUUID()))).toMatchObject({amount:'25000',reason:'Barang dikembalikan',reference:'NOTA-7'})
+    // Outstanding moves back up by exactly the refunded amount (BILL-001 counts refund effects).
+    const afterRefund=await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.financialDocuments).where(eq(schema.financialDocuments.id,refundDoc.id)))
+    expect(afterRefund[0]!.outstanding.toString()).toBe('65000')
+    expect(afterRefund[0]!.status).toBe('open')
+    const refundTrail=await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.financialDocumentEvents).where(eq(schema.financialDocumentEvents.documentId,refundDoc.id)))
+    expect(refundTrail.map(row=>row.action)).toEqual(['created','allocated','refunded'])
+    expect(refundTrail.find(row=>row.action==='refunded')).toMatchObject({actorId:'billing-unit',reason:'Barang dikembalikan',reference:'NOTA-7'})
+    const refundAudit=await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.auditEvents).where(eq(schema.auditEvents.entityId,refundPay.id)))
+    expect(refundAudit.some(row=>row.action==='payment.refunded'&&row.actorId==='billing-unit')).toBe(true)
+    // Only the mapped event posts a journal, and it is the mirror of the cash it returns.
+    const refundJournal=await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.journals).where(eq(schema.journals.eventId,refundEvent)))
+    expect(refundJournal).toHaveLength(1)
+    expect(refundJournal[0]).toMatchObject({eventType:'sales_refund',kind:'normal'})
+    const refundLines=await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.journalLines).where(eq(schema.journalLines.journalId,refundJournal[0]!.id)))
+    expect(refundLines.map(row=>[row.accountId,row.debit.toString(),row.credit.toString()]).sort()).toEqual([[ar,'25000','0'],[kasLedger,'0','25000']].sort())
+    // A replay of the same command returns the stored refund instead of refunding twice.
+    expect(await withActor(db,'billing-unit',tenant,(tx,a)=>refundPayment(tx,a,{paymentId:refundPay.id,documentId:refundDoc.id,amount:'25000',reason:'Barang dikembalikan',reference:'NOTA-7',eventId:refundEvent,bookDate:'2026-03-05'},randomUUID()))).toMatchObject({amount:'25000'})
+    expect(await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.paymentRefunds).where(eq(schema.paymentRefunds.paymentId,refundPay.id)))).toHaveLength(1)
+    // The refund is bounded by the allocation, not by the payment amount.
+    await expect(withActor(db,'billing-unit',tenant,(tx,a)=>refundPayment(tx,a,{paymentId:refundPay.id,documentId:refundDoc.id,amount:'35001',reason:'too much',eventId:randomUUID(),bookDate:'2026-03-05'},randomUUID()))).rejects.toThrow('Refund melebihi nilai yang dialokasikan')
+    // A refund needs a real allocation to correct.
+    const orphanDoc=await invoice('10000','2026-03-06','2026-04-06',customer)
+    await expect(withActor(db,'billing-unit',tenant,(tx,a)=>refundPayment(tx,a,{paymentId:refundPay.id,documentId:orphanDoc.id,amount:'1000',reason:'no allocation',eventId:randomUUID(),bookDate:'2026-03-06'},randomUUID()))).rejects.toThrow('Refund membutuhkan alokasi')
+    // RLS still hides the other tenant, and the refund is not a void substitute for allocated cash.
+    await expect(withActor(db,'user-b',B,(tx,a)=>refundPayment(tx,a,{paymentId:refundPay.id,documentId:refundDoc.id,amount:'1000',reason:'foreign',eventId:randomUUID(),bookDate:'2026-03-05'},randomUUID()))).rejects.toThrow('Payment unavailable')
+    // The guard is not only in the service: a direct insert beyond the allocation is refused.
+    await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`INSERT INTO payment_refunds(tenant_id,payment_id,document_id,amount,command_id,book_date,reason,actor_id) VALUES (${tenant},${refundPay.id},${refundDoc.id},100000,${randomUUID()},'2026-03-06','direct','billing-unit')`)),'Refund exceeds the allocated amount')
+    // Refund history is append-only: the runtime role has no UPDATE grant at all, so a corrected
+    // refund cannot be rewritten even before the immutability trigger would refuse it.
+    await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`UPDATE payment_refunds SET amount=1 WHERE payment_id=${refundPay.id}`)),'permission denied for table payment_refunds')
+    // Reads expose the collected pairs and the refund history the UI needs to bound the next refund.
+    expect((await withActor(db,'billing-unit',tenant,(tx,a)=>listAllocations(tx,a,{unitId:tenantUnit,paymentId:refundPay.id})))[0]).toMatchObject({documentId:refundDoc.id,amount:'60000'})
+    expect((await withActor(db,'billing-unit',tenant,(tx,a)=>listRefunds(tx,a,{unitId:tenantUnit}))).find(row=>row.paymentId===refundPay.id)).toMatchObject({amount:'25000',paymentNumber:refundPay.number,direction:'in'})
   })
 
 })

@@ -52,10 +52,10 @@ describe('[MBX-5][IAM-001/002] Nuxt HTTP boundary', async () => {
   })
   it('[MBX-8][CASH-001][BILL-001/002/003][PAY-001/002/003] protects billing APIs at the HTTP boundary', async () => {
     const root='/api/tenants/00000000-0000-4000-8000-000000000001/billing/'
-    for(const path of ['cash-accounts','documents','payments','aging']) {
+    for(const path of ['cash-accounts','documents','payments','aging','refunds','allocations']) {
       await expect($fetch(root+path)).rejects.toMatchObject({status:401})
     }
-    for(const path of ['cash-accounts','documents','payments','allocations','documents/void','payments/void']) {
+    for(const path of ['cash-accounts','documents','payments','allocations','documents/void','payments/void','payments/refund']) {
       await expect($fetch(root+path,{method:'POST',body:{}})).rejects.toMatchObject({status:403})
     }
     await expect($fetch(root+'documents',{method:'POST',body:{}})).rejects.toMatchObject({status:403})
