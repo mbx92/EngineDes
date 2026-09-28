@@ -60,4 +60,13 @@ describe('[MBX-5][IAM-001/002] Nuxt HTTP boundary', async () => {
     }
     await expect($fetch(root+'documents',{method:'POST',body:{}})).rejects.toMatchObject({status:403})
   })
+  it('[MBX-9][PROC-001/002/003] protects procurement APIs at the HTTP boundary', async () => {
+    const root='/api/tenants/00000000-0000-4000-8000-000000000001/procurement/'
+    for(const path of ['items','purchase-requests','rfqs','quotations']) {
+      await expect($fetch(root+path)).rejects.toMatchObject({status:401})
+    }
+    for(const path of ['items','purchase-requests','rfqs','quotations','purchase-requests/submit','rfqs/vendors']) {
+      await expect($fetch(root+path,{method:'POST',body:{}})).rejects.toMatchObject({status:403})
+    }
+  })
 })

@@ -20,4 +20,12 @@ export default defineEventHandler(event => authenticated(event, undefined, async
   canReadBilling: actor.grants.some(grant => !grant.locationId && can(actor,'financial.read',actor.tenantId,grant.unitId || undefined)),
   canManageCashAccounts: can(actor,'financial.configure',actor.tenantId),
   canPostBilling: actor.grants.some(grant => !grant.locationId && can(actor,'financial.post',actor.tenantId,grant.unitId || undefined)),
+  // [MBX-9][PROC-001..003] Procurement visibility and creation follow the same boundary as
+  // billing: reading is scoped to assigned Unit Usaha, and creation needs an explicit permission.
+  canReadProcurement: actor.grants.some(grant => !grant.locationId && can(actor,'procurement.read',actor.tenantId,grant.unitId || undefined)),
+  canCreatePurchaseRequest: actor.grants.some(grant => !grant.locationId && can(actor,'purchase_request.create',actor.tenantId,grant.unitId || undefined)),
+  canManageRfq: actor.grants.some(grant => !grant.locationId && can(actor,'rfq.create',actor.tenantId,grant.unitId || undefined)),
+  canQuoteProcurement: actor.grants.some(grant => !grant.locationId && can(actor,'quotation.create',actor.tenantId,grant.unitId || undefined)),
+  // Item/service master data is controlled master data, so it follows configuration authority.
+  canManageItems: can(actor,'configuration.manage',actor.tenantId),
 })))

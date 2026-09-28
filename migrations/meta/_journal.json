@@ -92,6 +92,13 @@
       "when": 1790578505865,
       "tag": "0012_slim_harpoon",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1790580964109,
+      "tag": "0013_fresh_shooting_star",
+      "breakpoints": true
     }
   ]
 }

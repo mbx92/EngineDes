@@ -25,6 +25,7 @@ import { allocateNumber } from '../server/core/governance/numbering'
 import { seedDummy } from '../server/core/governance/demo'
 import { createLedgerAccount, setAccountingMapping, postBusinessEvent, closeAccountingPeriod, reverseJournal, adjustJournal, trialBalance, ledger } from '../server/core/accounting/engine'
 import { allocatePayment, createCashAccount, createFinancialDocument, createPayment, listAllocations, listCashAccounts, listFinancialDocuments, listPayments, listRefunds, receivablesAging, refundPayment, voidFinancialDocument, voidPayment } from '../server/core/billing/billing'
+import { createItem, listItems, createPurchaseRequest, submitPurchaseRequest, listPurchaseRequests, createRfq, addRfqVendors, listRfqs, createQuotation, listQuotations } from '../server/core/procurement/procurement'
 
 const A = '00000000-0000-4000-8000-000000000001', B = '00000000-0000-4000-8000-000000000002'
 const A1 = '00000000-0000-4000-8000-000000000011', A2 = '00000000-0000-4000-8000-000000000012', B1 = '00000000-0000-4000-8000-000000000021'
@@ -39,6 +40,9 @@ const password = 'Local-test-passphrase-123!'
 // [MBX-8] Billing fixture identifiers, seeded in beforeAll under the privileged role.
 const BT='00000000-0000-4000-8000-000000000701', BU1='00000000-0000-4000-8000-000000000711', BU2='00000000-0000-4000-8000-000000000712'
 const BM='00000000-0000-4000-8000-000000000721', BMU='00000000-0000-4000-8000-000000000722'
+// [MBX-9] Procurement fixture identifiers, seeded in beforeAll under the privileged role.
+const PT='00000000-0000-4000-8000-000000000801', PU1='00000000-0000-4000-8000-000000000811', PU2='00000000-0000-4000-8000-000000000812'
+const PM='00000000-0000-4000-8000-000000000821', PMU='00000000-0000-4000-8000-000000000822'
 const rowsOf = (result: unknown): unknown[] => Array.isArray(result) ? result : (result as { rows: unknown[] }).rows
 // Database triggers are surfaced through drizzle's wrapped error, so assert on the cause.
 const dbRejection = async (run: () => Promise<unknown>, text: string) => {
@@ -85,6 +89,13 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
     await pg.query(`INSERT INTO auth_user(id,name,email) VALUES ('billing-admin','Billing Admin','billing-admin@example.test'),('billing-unit','Billing Unit','billing-unit@example.test')`)
     await pg.query(`INSERT INTO memberships(id,tenant_id,user_id) VALUES ($1,$3,'billing-admin'),($2,$3,'billing-unit')`, [BM, BMU, BT])
     await pg.query(`INSERT INTO role_grants(tenant_id,membership_id,role,scope,unit_id) VALUES ($1,$2,'admin','tenant',NULL),($1,$3,'finance','unit',$4),($1,$2,'finance','tenant',NULL)`, [BT, BM, BMU, BU1])
+    // [MBX-9] Procurement tenant: one tenant-scoped administrator who owns master data and
+    // sequencing, and one Unit-scoped `procurement` grant that must stay inside its assigned Unit.
+    await pg.query(`INSERT INTO tenants(id,name) VALUES ($1,'BUMDes Procurement')`, [PT])
+    await pg.query(`INSERT INTO units(id,tenant_id,name,code) VALUES ($1,$3,'Toko Procurement','PROC-1'),($2,$3,'Jasa Procurement','PROC-2')`, [PU1, PU2, PT])
+    await pg.query(`INSERT INTO auth_user(id,name,email) VALUES ('procurement-admin','Procurement Admin','procurement-admin@example.test'),('procurement-unit','Procurement Unit','procurement-unit@example.test')`)
+    await pg.query(`INSERT INTO memberships(id,tenant_id,user_id) VALUES ($1,$3,'procurement-admin'),($2,$3,'procurement-unit')`, [PM, PMU, PT])
+    await pg.query(`INSERT INTO role_grants(tenant_id,membership_id,role,scope,unit_id) VALUES ($1,$2,'admin','tenant',NULL),($1,$3,'procurement','unit',$4)`, [PT, PM, PMU, PU1])
   })
   beforeEach(async () => { await pg.exec('SET ROLE enginedes_app') })
   afterEach(async () => { await pg.exec('RESET ROLE') })
@@ -409,8 +420,9 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
   })
   it('[ORG-001][PARTY-001][AUDIT-001] dummy seed is idempotent and leaves users pending without demo passwords', async () => {
     const first=await seedDummy(db,'admin-a',A),second=await seedDummy(db,'admin-a',A)
-    expect(first.created).toBe(34);expect(second.created).toBe(0)
+    expect(first.created).toBe(40);expect(second.created).toBe(0)
     expect(first.ledgerAccounts).toBe(5);expect(first.accountingMappings).toBe(7);expect(first.billingSequences).toBe(3)
+    expect(first.procurementSequences).toBe(3);expect(first.procurementItems).toBe(3)
     expect(await withActor(db,'admin-a',A,tx=>tx.select().from(schema.journals))).toEqual([])
     const users=await withActor(db,'admin-a',A,tx=>tx.execute(sql`SELECT m.pending,m.active FROM memberships m JOIN auth_user u ON u.id=m.user_id WHERE u.email LIKE 'demo.%@example.test'`))
     const seededUsers=rowsOf(users) as {pending:boolean;active:boolean}[]
@@ -734,6 +746,103 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
     // Reads expose the collected pairs and the refund history the UI needs to bound the next refund.
     expect((await withActor(db,'billing-unit',tenant,(tx,a)=>listAllocations(tx,a,{unitId:tenantUnit,paymentId:refundPay.id})))[0]).toMatchObject({documentId:refundDoc.id,amount:'60000'})
     expect((await withActor(db,'billing-unit',tenant,(tx,a)=>listRefunds(tx,a,{unitId:tenantUnit}))).find(row=>row.paymentId===refundPay.id)).toMatchObject({amount:'25000',paymentNumber:refundPay.number,direction:'in'})
+  })
+
+  // ---------------------------------------------------------------------------------------
+  // [MBX-9] Procurement source documents: PR -> RFQ -> vendor quotation.
+  // These assertions need server-backed PostgreSQL too, because the append-only, line and
+  // invited-vendor guards are database triggers the PGlite WASM fallback cannot run faithfully.
+  // ---------------------------------------------------------------------------------------
+  it.runIf(!!process.env.TEST_DATABASE_URL)('[MBX-9][PROC-001][PROC-002][PROC-003] procurement source flow', async () => {
+    const tenant=PT, unit=PU1, otherUnit=PU2
+    for (const type of ['purchase_request','rfq','vendor_quotation']) {
+      await withActor(db,'procurement-admin',tenant,(tx,a)=>setConfiguration(tx,a,{key:'sequence:'+type,value:{prefix:'PROC-'+type.slice(0,3).toUpperCase(),scope:'unit',reset:'month'},expectedRevision:0},randomUUID()))
+    }
+    const vendorParty=(code:string,name:string,unitId:string|null)=>withActor(db,'procurement-admin',tenant,(tx,a)=>saveParty(tx,a,undefined,{kind:'organization',name,code,roles:[{role:'vendor',unitId}]},randomUUID()))
+    const vendor=(await vendorParty('PROC-V1','Pemasok Satu',null)).id
+    const vendor2=(await vendorParty('PROC-V2','Pemasok Dua',null)).id
+    const uninvited=(await vendorParty('PROC-V3','Pemasok Tiga',null)).id
+    const outsider=(await vendorParty('PROC-V4','Pemasok Empat',null)).id
+
+    // [PROC-001][CFG-001] Item master data is controlled master data: only the admin role writes it.
+    const item=(await withActor(db,'procurement-admin',tenant,(tx,a)=>createItem(tx,a,{unitId:null,code:'PROC-ITM-1',name:'Beras',kind:'item',uom:'sak'},randomUUID()))).id
+    const service=(await withActor(db,'procurement-admin',tenant,(tx,a)=>createItem(tx,a,{unitId:null,code:'PROC-SVC-1',name:'Angkut',kind:'service',uom:'trip'},randomUUID()))).id
+    await expect(withActor(db,'procurement-unit',tenant,(tx,a)=>createItem(tx,a,{unitId:null,code:'PROC-NO',name:'Nope',kind:'item',uom:'pcs'},randomUUID()))).rejects.toThrow()
+    expect((await withActor(db,'procurement-unit',tenant,(tx,a)=>listItems(tx,a,{unitId:unit}))).map(row=>row.code).sort()).toEqual(['PROC-ITM-1','PROC-SVC-1'])
+
+    // [PROC-001][ORG-003][AUDIT-001] A PR stores Unit, item/service lines, quantity, justification
+    // and status, and is numbered from configured sequencing.
+    const pr=(unitId:string,itemId:string)=>withActor(db,'procurement-unit',tenant,(tx,a)=>createPurchaseRequest(tx,a,{unitId,locationId:null,bookDate:'2026-04-01',justification:'Kebutuhan operasional',lines:[{itemId,quantity:'10'}],commandId:randomUUID()},randomUUID()))
+    const request=await pr(unit,item)
+    expect(request).toMatchObject({status:'draft',unitId:unit,requestedBy:'procurement-unit'})
+    expect(request.number).toContain('PROC-PUR')
+    expect(request.lines.map(line=>[line.itemId,line.quantity])).toEqual([[item,'10']])
+    // The Unit-scoped procurement grant cannot raise a PR outside its assigned Unit.
+    await expect(pr(otherUnit,item)).rejects.toThrow('Permission or scope denied')
+    // An unknown/inactive item is refused rather than silently accepted as free text.
+    await expect(withActor(db,'procurement-unit',tenant,(tx,a)=>createPurchaseRequest(tx,a,{unitId:unit,locationId:null,bookDate:'2026-04-01',justification:'x',lines:[{itemId:randomUUID(),quantity:'1'}],commandId:randomUUID()},randomUUID()))).rejects.toThrow('Item unavailable')
+    const list=await withActor(db,'procurement-unit',tenant,(tx,a)=>listPurchaseRequests(tx,a,{unitId:unit,status:'draft'}))
+    expect(list.find(row=>row.id===request.id)).toMatchObject({justification:'Kebutuhan operasional'})
+
+    // [SEQ-001] A replayed PR command returns the same document instead of duplicating it.
+    const replay={unitId:unit,locationId:null,bookDate:'2026-04-02',justification:'Retry',lines:[{itemId:service,quantity:'2'}],commandId:randomUUID()}
+    const createdPr=await withActor(db,'procurement-unit',tenant,(tx,a)=>createPurchaseRequest(tx,a,replay,randomUUID()))
+    expect((await withActor(db,'procurement-unit',tenant,(tx,a)=>createPurchaseRequest(tx,a,replay,randomUUID()))).id).toBe(createdPr.id)
+    expect(await withActor(db,'procurement-unit',tenant,tx=>tx.select().from(schema.purchaseRequests).where(eq(schema.purchaseRequests.commandId,replay.commandId)))).toHaveLength(1)
+
+    // [PROC-001] Submitting is the only status move this slice owns, and it records the submitter.
+    const submitted=await withActor(db,'procurement-unit',tenant,(tx,a)=>submitPurchaseRequest(tx,a,{purchaseRequestId:request.id},randomUUID()))
+    expect(submitted).toMatchObject({status:'submitted',submittedBy:'procurement-unit'})
+    await expect(withActor(db,'procurement-unit',tenant,(tx,a)=>submitPurchaseRequest(tx,a,{purchaseRequestId:request.id},randomUUID()))).rejects.toThrow('Hanya draft')
+
+    // [PROC-002] An RFQ is addressed to several Vendors; an RFQ needs a submitted PR.
+    await expect(withActor(db,'procurement-unit',tenant,(tx,a)=>createRfq(tx,a,{purchaseRequestId:createdPr.id,bookDate:'2026-04-03',vendorIds:[vendor],note:null,commandId:randomUUID()},randomUUID()))).rejects.toThrow('Purchase Request berstatus submitted')
+    const rfq=await withActor(db,'procurement-unit',tenant,(tx,a)=>createRfq(tx,a,{purchaseRequestId:request.id,bookDate:'2026-04-03',vendorIds:[vendor,vendor2],note:'Mohon penawaran',commandId:randomUUID()},randomUUID()))
+    expect(rfq.vendorIds.sort()).toEqual([vendor,vendor2].sort())
+    expect(rfq.number).toContain('PROC-RFQ')
+    // A non-vendor Party cannot be invited to quote.
+    await expect(withActor(db,'procurement-unit',tenant,(tx,a)=>createRfq(tx,a,{purchaseRequestId:request.id,bookDate:'2026-04-04',vendorIds:[randomUUID()],note:null,commandId:randomUUID()},randomUUID()))).rejects.toThrow('Vendor Party not available')
+    // Vendors can still be added, and adding one twice is idempotent.
+    expect((await withActor(db,'procurement-unit',tenant,(tx,a)=>addRfqVendors(tx,a,{rfqId:rfq.id,vendorIds:[uninvited,vendor]},randomUUID()))).vendorIds.sort()).toEqual([vendor,vendor2,uninvited].sort())
+    expect((await withActor(db,'procurement-unit',tenant,(tx,a)=>listRfqs(tx,a,{unitId:unit}))).find(row=>row.id===rfq.id)?.vendorIds).toHaveLength(3)
+
+    // [PROC-003][PROC-004] A quotation stores per-Vendor, per-item price and commercial terms.
+    const quote=(partyId:string,unitPrice:string,extra:Record<string,unknown>={})=>withActor(db,'procurement-unit',tenant,(tx,a)=>createQuotation(tx,a,{rfqId:rfq.id,partyId,bookDate:'2026-04-05',validUntil:'2026-04-30',paymentTerm:'Net 30',deliveryDays:7,lines:[{itemId:item,quantity:'10',unitPrice}],supersedesId:null,...extra,commandId:randomUUID()},randomUUID()))
+    const first=await quote(vendor,'7500')
+    expect(first).toMatchObject({revision:1,paymentTerm:'Net 30',deliveryDays:7,partyId:vendor})
+    expect(first.lines.map(line=>[line.itemId,line.quantity,line.unitPrice])).toEqual([[item,'10','7500']])
+    const second=await quote(vendor2,'7000')
+    // The same RFQ now holds quotations from more than one Vendor.
+    const quotations=await withActor(db,'procurement-unit',tenant,(tx,a)=>listQuotations(tx,a,{rfqId:rfq.id,unitId:unit}))
+    expect(quotations.map(row=>row.partyId).sort()).toEqual([vendor,vendor2].sort())
+    expect(quotations.find(row=>row.id===first.id)?.total).toBe('75000')
+    // A Vendor that was never invited cannot quote this RFQ.
+    await expect(quote(outsider,'1')).rejects.toThrow('belum diundang')
+    // [AUDIT-001] A correction is a new revision that supersedes the prior one; history is kept.
+    const revised=await quote(vendor,'7200',{supersedesId:first.id})
+    expect(revised).toMatchObject({revision:2,supersedesId:first.id})
+    await expect(quote(vendor2,'1',{supersedesId:first.id})).rejects.toThrow('vendor yang sama')
+    const audit=await withActor(db,'procurement-unit',tenant,tx=>tx.select().from(schema.auditEvents).where(eq(schema.auditEvents.entityId,revised.id)))
+    expect(audit.some(row=>row.action==='vendor_quotation.created'&&row.actorId==='procurement-unit')).toBe(true)
+
+    // [NFR-SEC-002] Tenant isolation: another BUMDes sees none of these procurement records,
+    // which is why a foreign request surfaces as "unavailable" instead of leaking existence.
+    expect(rowsOf(await withActor(db,'user-b',B,tx=>tx.execute(sql`SELECT id FROM purchase_requests WHERE id=${request.id}`)))).toEqual([])
+    expect(rowsOf(await withActor(db,'user-b',B,tx=>tx.execute(sql`SELECT id FROM vendor_quotations WHERE id=${first.id}`)))).toEqual([])
+    expect(rowsOf(await withActor(db,'user-b',B,tx=>tx.execute(sql`SELECT id FROM items WHERE id=${item}`)))).toEqual([])
+    await expect(withActor(db,'user-b',B,(tx,a)=>submitPurchaseRequest(tx,a,{purchaseRequestId:request.id},randomUUID()))).rejects.toThrow('unavailable')
+    await dbRejection(()=>withActor(db,'user-b',B,tx=>tx.execute(sql`INSERT INTO items(tenant_id,code,name,kind,uom,actor_id) VALUES (${tenant},'PROC-X','X','item','pcs',${'user-b'})`)),'row-level security')
+
+    // The guards are not only in the service. Append-only tables carry no UPDATE grant at all, so a
+    // stored quotation or item cannot be rewritten even before the immutability trigger would fire.
+    await dbRejection(()=>withActor(db,'procurement-unit',tenant,tx=>tx.execute(sql`UPDATE vendor_quotations SET payment_term='Net 90' WHERE id=${first.id}`)),'permission denied for table vendor_quotations')
+    await dbRejection(()=>withActor(db,'procurement-unit',tenant,tx=>tx.execute(sql`UPDATE items SET name='Berubah' WHERE id=${item}`)),'permission denied for table items')
+    // A submitted Purchase Request cannot be re-opened or edited through direct SQL either.
+    await dbRejection(()=>withActor(db,'procurement-unit',tenant,tx=>tx.execute(sql`UPDATE purchase_requests SET status='draft', submitted_by=NULL, submitted_at=NULL WHERE id=${request.id}`)),'immutable')
+    await dbRejection(()=>withActor(db,'procurement-unit',tenant,tx=>tx.execute(sql`UPDATE purchase_requests SET justification='Ubah diam-diam' WHERE id=${request.id}`)),'facts are immutable')
+    await dbRejection(()=>withActor(db,'procurement-unit',tenant,tx=>tx.execute(sql`UPDATE purchase_requests SET justification='Ubah draft' WHERE id=${createdPr.id}`)),'facts are immutable')
+    await dbRejection(()=>withActor(db,'procurement-unit',tenant,tx=>tx.execute(sql`INSERT INTO vendor_quotations(tenant_id,number,command_id,rfq_id,party_id,unit_id,book_date,revision,actor_id) VALUES (${tenant},'FORGED',${randomUUID()},${rfq.id},${outsider},${unit},'2026-04-06',1,'procurement-unit')`)),'not invited')
+    await dbRejection(()=>withActor(db,'procurement-unit',tenant,tx=>tx.execute(sql`INSERT INTO purchase_request_lines(tenant_id,purchase_request_id,line_no,item_id,quantity) VALUES (${tenant},${request.id},99,${item},1)`)),'must be inserted with their new document')
   })
 
 })

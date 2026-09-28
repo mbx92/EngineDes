@@ -20,7 +20,7 @@ async function copyLink() {
 }
 function closeAction() { actionDialog.value?.close(); clearLink() }
 onBeforeUnmount(clearLink)
-const roleLabels: Record<string, string> = { admin: 'Admin BUMDes', director: 'Direktur', finance: 'Keuangan', unit_manager: 'Kepala Unit', operator: 'Operator', supervisor: 'Pengawas' }
+const roleLabels: Record<string, string> = { admin: 'Admin BUMDes', director: 'Direktur', finance: 'Keuangan', unit_manager: 'Kepala Unit', operator: 'Operator', procurement: 'Pengadaan', supervisor: 'Pengawas' }
 const state = (item: ManagedUser) => item.pending ? 'pending' : item.active ? 'active' : 'disabled'
 const visible = computed(() => users.value.filter(item => (filter.value === 'all' || filter.value === state(item))
   && (item.name + ' ' + item.email).toLocaleLowerCase('id').includes(search.value.trim().toLocaleLowerCase('id'))))
