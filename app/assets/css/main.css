@@ -878,6 +878,14 @@ tbody tr:hover{
   background:#f2f4f7;
   color:#8792a1
 }
+.status-pill.paid{
+  background:#eaf7f0;
+  color:#26966d
+}
+.status-pill.void{
+  background:#fdeef0;
+  color:#a4515d
+}
 .status-pill .small-dot{
   width:4px;
   height:4px

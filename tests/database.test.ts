@@ -24,7 +24,7 @@ import { validateTransactionContext, requireApproval } from '../server/core/gove
 import { allocateNumber } from '../server/core/governance/numbering'
 import { seedDummy } from '../server/core/governance/demo'
 import { createLedgerAccount, setAccountingMapping, postBusinessEvent, closeAccountingPeriod, reverseJournal, adjustJournal, trialBalance, ledger } from '../server/core/accounting/engine'
-import { allocatePayment, createCashAccount, createFinancialDocument, createPayment, listCashAccounts, listFinancialDocuments, receivablesAging, voidFinancialDocument } from '../server/core/billing/billing'
+import { allocatePayment, createCashAccount, createFinancialDocument, createPayment, listCashAccounts, listFinancialDocuments, listPayments, receivablesAging, voidFinancialDocument, voidPayment } from '../server/core/billing/billing'
 
 const A = '00000000-0000-4000-8000-000000000001', B = '00000000-0000-4000-8000-000000000002'
 const A1 = '00000000-0000-4000-8000-000000000011', A2 = '00000000-0000-4000-8000-000000000012', B1 = '00000000-0000-4000-8000-000000000021'
@@ -409,8 +409,8 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
   })
   it('[ORG-001][PARTY-001][AUDIT-001] dummy seed is idempotent and leaves users pending without demo passwords', async () => {
     const first=await seedDummy(db,'admin-a',A),second=await seedDummy(db,'admin-a',A)
-    expect(first.created).toBe(22);expect(second.created).toBe(0)
-    expect(first.ledgerAccounts).toBe(2);expect(first.accountingMappings).toBe(1)
+    expect(first.created).toBe(32);expect(second.created).toBe(0)
+    expect(first.ledgerAccounts).toBe(5);expect(first.accountingMappings).toBe(5);expect(first.billingSequences).toBe(3)
     expect(await withActor(db,'admin-a',A,tx=>tx.select().from(schema.journals))).toEqual([])
     const users=await withActor(db,'admin-a',A,tx=>tx.execute(sql`SELECT m.pending,m.active FROM memberships m JOIN auth_user u ON u.id=m.user_id WHERE u.email LIKE 'demo.%@example.test'`))
     const seededUsers=rowsOf(users) as {pending:boolean;active:boolean}[]
@@ -599,7 +599,12 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
     await expect(withActor(db,'billing-unit',tenant,(tx,a)=>createFinancialDocument(tx,a,{type:'invoice',unitId:tenantUnit,locationId:null,partyId:vendor,bookDate:'2026-02-01',dueDate:'2026-03-01',amount:'100000',commandId:randomUUID()},randomUUID()))).rejects.toThrow('Customer Party not available')
     await expect(withActor(db,'billing-unit',tenant,(tx,a)=>createFinancialDocument(tx,a,{type:'bill',unitId:tenantUnit,locationId:null,partyId:customer,bookDate:'2026-02-01',dueDate:'2026-03-01',amount:'100000',commandId:randomUUID()},randomUUID()))).rejects.toThrow('Vendor Party not available')
     const billed=await withActor(db,'billing-unit',tenant,(tx,a)=>createFinancialDocument(tx,a,{type:'bill',unitId:tenantUnit,locationId:null,partyId:vendor,bookDate:'2026-02-01',dueDate:'2026-03-01',amount:'100000',commandId:randomUUID()},randomUUID()))
-    expect(billed).toMatchObject({ type:'bill', outstanding:100000n, status:'open' })
+    // The return value is the HTTP boundary: whole-rupiah quantities must be exact strings.
+    expect(billed).toMatchObject({ type:'bill', outstanding:'100000', amount:'100000', status:'open' })
+    const listed=await withActor(db,'billing-unit',tenant,(tx,a)=>listFinancialDocuments(tx,a,{unitId:tenantUnit,type:'bill'}))
+    expect(listed.find(row=>row.id===billed.id)?.outstanding).toBe('100000')
+    const listedPayments=await withActor(db,'billing-unit',tenant,(tx,a)=>listPayments(tx,a,{unitId:tenantUnit,partyId:vendor}))
+    expect(listedPayments.every((row:{amount:string;allocated:string})=>typeof row.amount==='string'&&typeof row.allocated==='string')).toBe(true)
 
     // [SEQ-001] a replayed command returns the same document with a single journal.
     const replay={type:'invoice' as const,unitId:tenantUnit,locationId:null,partyId:customer,bookDate:'2026-02-02',dueDate:'2026-03-02',amount:'50000',commandId:randomUUID()}
@@ -644,6 +649,31 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
     } catch (error) {
       expect(String((error as {cause?:Error}).cause || error)).toContain('Void is not permitted once allocations exist')
     }
+
+    // [PAY-003][AUDIT-001][ACC-003] payment void keeps actor/reason/reference, reverses the
+    // original cash journal, and is refused once the payment carries an allocation.
+    const cancellable=await withActor(db,'billing-unit',tenant,(tx,a)=>createPayment(tx,a,{direction:'in',unitId:tenantUnit,locationId:null,partyId:customer,cashAccountId:kas,bookDate:'2026-02-09',amount:'25000',commandId:randomUUID()},randomUUID()))
+    const voided=await withActor(db,'billing-unit',tenant,(tx,a)=>voidPayment(tx,a,{paymentId:cancellable.id,reason:'Salah kas',reference:'MEMO-11',eventId:randomUUID(),reversalDate:'2026-02-10'},randomUUID()))
+    expect(voided).toMatchObject({status:'void',reason:'Salah kas',reference:'MEMO-11',voidedBy:'billing-unit'})
+    const paymentAudit=await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.auditEvents).where(eq(schema.auditEvents.entityId,cancellable.id)))
+    expect(paymentAudit.some(row=>row.action==='payment.voided'&&row.actorId==='billing-unit')).toBe(true)
+    const cashJournals=await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.journals).where(eq(schema.journals.eventId,cancellable.commandId)))
+    expect(cashJournals).toHaveLength(1)
+    const reversal=await withActor(db,'billing-unit',tenant,tx=>tx.select().from(schema.journals).where(sql`${schema.journals.kind}='reversal' AND ${schema.journals.correctsId}=${cashJournals[0]!.id}`))
+    expect(reversal).toHaveLength(1)
+    await expect(withActor(db,'billing-unit',tenant,(tx,a)=>voidPayment(tx,a,{paymentId:cancellable.id,reason:'again',eventId:randomUUID(),reversalDate:'2026-02-10'},randomUUID()))).rejects.toThrow('sudah dibatalkan')
+    // An allocated payment must not be voided: the allocated history stays meaningful.
+    try {
+      await withActor(db,'billing-unit',tenant,(tx,a)=>voidPayment(tx,a,{paymentId:small.id,reason:'attempt',eventId:randomUUID(),reversalDate:'2026-02-10'},randomUUID()))
+      throw new Error('Void of an allocated payment unexpectedly succeeded')
+    } catch (error) {
+      expect(String((error as {cause?:Error}).cause || error)).toContain('Void is not permitted once the payment is allocated')
+    }
+    // A voided payment is closed for further allocation.
+    await expect(withActor(db,'billing-unit',tenant,(tx,a)=>allocatePayment(tx,a,{paymentId:cancellable.id,documentId:partially.id,amount:'1'},randomUUID()))).rejects.toThrow('tidak dalam status posted')
+    // The guard is not only in the service: direct SQL void without an actor is refused.
+    await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`UPDATE payments SET status='void' WHERE id=${cancellable.id}`)),'Voided payment is immutable')
+    await dbRejection(()=>withActor(db,'billing-unit',tenant,tx=>tx.execute(sql`UPDATE payments SET status='void', voided_by=voided_by WHERE id=${small.id}`)),'Void requires an actor')
 
     // [BILL-001][NFR-SEC-002] outstanding is stored, cannot increase, and cannot move by direct SQL.
     const spare=await withActor(db,'billing-unit',tenant,(tx,a)=>createPayment(tx,a,{direction:'in',unitId:tenantUnit,locationId:null,partyId:customer,cashAccountId:kas,bookDate:'2026-02-09',amount:'100',commandId:randomUUID()},randomUUID()))
