@@ -6,9 +6,9 @@ Requirements: CASH-001, BILL-001..003, PAY-001..003, PARTY-003/004, ACC-002..005
 
 This slice delivers money-flow foundations: tenant-owned cash/bank accounts, AR/AP documents with stored outstanding, aging, payments, payment allocation, and audited void. It is the first real consumer of the Phase 2 Business Event contract.
 
-Delivered: migrations 0009–0010 (schema, forced RLS, least-privilege grants, append-only and money-flow guards), `server/core/billing/billing.ts`, and PostgreSQL acceptance coverage.
+Delivered: migrations 0009–0010 (schema, forced RLS, least-privilege grants, append-only and money-flow guards), `server/core/billing/billing.ts`, HTTP API routes under `server/api/tenants/[tenantId]/billing/`, the `BillingPanel.vue` surface wired into the shell, and PostgreSQL acceptance coverage.
 
-Not yet delivered, and not claimed: HTTP API routes, billing UI, refund commands, overpayment policy configuration, approval rules (deferred to MBX-11), and procurement-derived vendor bills (MBX-11). No business module composes billing commands yet.
+Not yet delivered, and not claimed: refund commands, overpayment policy configuration, approval rules (deferred to MBX-11), and procurement-derived vendor bills (MBX-11). No other business module composes billing commands yet.
 
 ## Accepted policies
 
@@ -31,12 +31,18 @@ The five policies absent from the product sources were decided by the PM and rec
 - **Idempotency (SEQ-001, ACC-001)** reuses the established contract: document and payment creation return the existing row when the stored command ID is replayed, so a retry cannot allocate a second number or post a second journal. Numbering continues to come from `allocateNumber` with the caller's transaction.
 - **Isolation (NFR-SEC-002)** is forced RLS on all five new tables with tenant-aware composite foreign keys, and runtime grants are append-only: `SELECT, INSERT` on the event trail and allocations, `SELECT, INSERT, UPDATE` only where a stored balance must move.
 
+## HTTP boundary and UI
+
+- **Routes** mirror the Phase 2 accounting pattern under `server/api/tenants/[tenantId]/billing/`: `GET/POST cash-accounts`, `GET/POST documents`, `POST documents/void`, `GET aging`, `GET/POST payments`, `POST allocations`. Reads are `no-store` and permission-checked in Core; mutations enforce same-origin then resolve the actor through `authenticated`. Tenant scope comes only from the path plus the session, never from the body.
+- **Capabilities** in `access.get.ts` add `canReadBilling`, `canManageCashAccounts` and `canPostBilling`. Read and post follow the Phase 2 boundary — tenant Admin configures cash accounts, Finance posts inside its assigned Unit scope — and the UI hides the cash-account tab from non-configurators.
+- **`BillingPanel.vue`** exposes four tabs: cash/bank accounts (with ledger-account picker), documents (invoice/bill registration, outstanding list, audited void), receivables/payables aging with bucket cards, and payments (recording plus allocation from a selected payment to a matching open document). It reuses the existing `AccountingPanel` layout, tab semantics and error handling, and revalidates against the server on every mutation.
+
 ## Local verification and QA
 
 Run `corepack pnpm test:postgres`, `corepack pnpm typecheck`, `corepack pnpm build` and `corepack pnpm test:artifact`.
 
-The billing acceptance test is guarded by `TEST_DATABASE_URL` because its guarantees are database triggers, which the PGlite WASM fallback cannot run faithfully. It therefore executes under `test:postgres` and CI, which create and drop a disposable network PostgreSQL database under the restricted runtime role. Coverage includes: two-account configuration and role denial; AR/AP Party-role requirements; due-date and amount validation; sequence replay; aging bucket boundaries; partial payment keeping the document open; over-allocation denial against both bounds and closed documents; cross-tenant invisibility; void audit trail and allocated-document refusal; direct-SQL immutability and outstanding protection; and closed-period rejection.
+The billing acceptance test is guarded by `TEST_DATABASE_URL` because its guarantees are database triggers, which the PGlite WASM fallback cannot run faithfully. It therefore executes under `test:postgres` and CI, which create and drop a disposable network PostgreSQL database under the restricted runtime role. Coverage includes: two-account configuration and role denial; AR/AP Party-role requirements; due-date and amount validation; sequence replay; aging bucket boundaries; partial payment keeping the document open; over-allocation denial against both bounds and closed documents; cross-tenant invisibility; void audit trail and allocated-document refusal; direct-SQL immutability and outstanding protection; and closed-period rejection. `tests/http.test.ts` additionally asserts every billing read returns 401 without a session and every mutation returns 403 without a trusted Origin.
 
-The local development database has migrations 0009–0010 applied. `corepack pnpm test` (PGlite) reports two pre-existing failures in `trialBalance`, which is Phase 2 code in `server/core/accounting/engine.ts` and is untouched by this slice; the real PostgreSQL run passes all 54 tests, consistent with the Phase 2 note that PGlite cannot faithfully reproduce those semantics.
+The local development database has migrations 0009–0010 applied. `corepack pnpm test` (PGlite) reports two pre-existing failures in `trialBalance`, which is Phase 2 code in `server/core/accounting/engine.ts` and is untouched by this slice; the real PostgreSQL run passes all 55 tests, consistent with the Phase 2 note that PGlite cannot faithfully reproduce those semantics.
 
-No billing UI is exposed yet, so there is nothing to exercise by hand in Akuntansi for this slice. Refund, overpayment policy and approval integration remain open and are tracked in Linear.
+No refund, overpayment policy or approval flow is exposed yet, so there is nothing to exercise by hand for those; they remain open and are tracked in Linear.
