@@ -24,6 +24,7 @@ Use Conventional Commits with the Linear issue and affected requirement IDs:
 | MBX-6/7 | ACC, MAP, LOCK, CFG, SEQ | `server/core/accounting`, `server/core/governance` | 0004–0008 | `tests/database.test.ts` (accounting) |
 | MBX-8 | CASH-001, BILL-001..003, PAY-001..003 | `server/core/billing` | 0009–0012 | `tests/database.test.ts` (billing) |
 | MBX-9 | PROC-001..004 | `server/core/procurement` | 0013 | `tests/database.test.ts` (procurement) |
+| MBX-10 | PROC-004 | `server/core/procurement/comparison.ts` | — (read model, no table) | `tests/database.test.ts` (comparison) |
 
 Each slice's design decision, accepted policy and verification evidence is recorded in its `docs/engineering/MBX-*.md` page.
 

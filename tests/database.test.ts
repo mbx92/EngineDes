@@ -26,6 +26,8 @@ import { seedDummy } from '../server/core/governance/demo'
 import { createLedgerAccount, setAccountingMapping, postBusinessEvent, closeAccountingPeriod, reverseJournal, adjustJournal, trialBalance, ledger } from '../server/core/accounting/engine'
 import { allocatePayment, createCashAccount, createFinancialDocument, createPayment, listAllocations, listCashAccounts, listFinancialDocuments, listPayments, listRefunds, receivablesAging, refundPayment, voidFinancialDocument, voidPayment } from '../server/core/billing/billing'
 import { createItem, listItems, createPurchaseRequest, submitPurchaseRequest, listPurchaseRequests, createRfq, addRfqVendors, listRfqs, createQuotation, listQuotations } from '../server/core/procurement/procurement'
+import { compareQuotations } from '../server/core/procurement/comparison'
+import { readConfiguration } from '../server/core/governance/configuration'
 
 const A = '00000000-0000-4000-8000-000000000001', B = '00000000-0000-4000-8000-000000000002'
 const A1 = '00000000-0000-4000-8000-000000000011', A2 = '00000000-0000-4000-8000-000000000012', B1 = '00000000-0000-4000-8000-000000000021'
@@ -843,6 +845,114 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
     await dbRejection(()=>withActor(db,'procurement-unit',tenant,tx=>tx.execute(sql`UPDATE purchase_requests SET justification='Ubah draft' WHERE id=${createdPr.id}`)),'facts are immutable')
     await dbRejection(()=>withActor(db,'procurement-unit',tenant,tx=>tx.execute(sql`INSERT INTO vendor_quotations(tenant_id,number,command_id,rfq_id,party_id,unit_id,book_date,revision,actor_id) VALUES (${tenant},'FORGED',${randomUUID()},${rfq.id},${outsider},${unit},'2026-04-06',1,'procurement-unit')`)),'not invited')
     await dbRejection(()=>withActor(db,'procurement-unit',tenant,tx=>tx.execute(sql`INSERT INTO purchase_request_lines(tenant_id,purchase_request_id,line_no,item_id,quantity) VALUES (${tenant},${request.id},99,${item},1)`)),'must be inserted with their new document')
+  })
+
+  // ---------------------------------------------------------------------------------------
+  // [MBX-10] Vendor comparison over the quotations MBX-9 already stores. There is no table, no
+  // migration and no write path, so there is no audit trail to assert. The guarantees are the
+  // read-model ones PROC-004 names: effective revision per Vendor, side-by-side item price,
+  // total, delivery and payment terms, and history that is only shown when evidence exists.
+  // ---------------------------------------------------------------------------------------
+  it.runIf(!!process.env.TEST_DATABASE_URL)('[MBX-10][PROC-004] vendor comparison uses the effective revision and only evidenced history', async () => {
+    const tenant=PT, unit=PU1
+    // Sequences are tenant-wide configuration, so they are only created when absent: the MBX-9 test
+    // in this same file already owns them, and the revision guard rejects a blind second write.
+    for (const type of ['purchase_request','rfq','vendor_quotation']) {
+      const key='sequence:'+type
+      if (!await withActor(db,'procurement-admin',tenant,(tx,a)=>readConfiguration(tx,a.tenantId,key)))
+        await withActor(db,'procurement-admin',tenant,(tx,a)=>setConfiguration(tx,a,{key,value:{prefix:'CMP-'+type.slice(0,3).toUpperCase(),scope:'unit',reset:'month'},expectedRevision:0},randomUUID()))
+    }
+    const vendorParty=(code:string,name:string)=>withActor(db,'procurement-admin',tenant,(tx,a)=>saveParty(tx,a,undefined,{kind:'organization',name,code,roles:[{role:'vendor',unitId:null}]},randomUUID()))
+    const vendor1=(await vendorParty('CMP-V1','Pemasok Satu')).id
+    const vendor2=(await vendorParty('CMP-V2','Pemasok Dua')).id
+    const vendor3=(await vendorParty('CMP-V3','Pemasok Tiga')).id
+    const item=(await withActor(db,'procurement-admin',tenant,(tx,a)=>createItem(tx,a,{unitId:null,code:'CMP-ITM-1',name:'Gula',kind:'item',uom:'sak'},randomUUID()))).id
+
+    // Raising a submitted PR with an RFQ to the given vendors is the shared setup for both rounds.
+    const openRfq=async(vendorIds:string[],bookDate:string)=>{
+      const request=await withActor(db,'procurement-unit',tenant,(tx,a)=>createPurchaseRequest(tx,a,{unitId:unit,locationId:null,bookDate,justification:'Uji perbandingan',lines:[{itemId:item,quantity:'10'}],commandId:randomUUID()},randomUUID()))
+      await withActor(db,'procurement-unit',tenant,(tx,a)=>submitPurchaseRequest(tx,a,{purchaseRequestId:request.id},randomUUID()))
+      return withActor(db,'procurement-unit',tenant,(tx,a)=>createRfq(tx,a,{purchaseRequestId:request.id,bookDate,vendorIds,note:null,commandId:randomUUID()},randomUUID()))
+    }
+    const quote=(rfqId:string,partyId:string,unitPrice:string,bookDate:string,extra:Record<string,unknown>={})=>withActor(db,'procurement-unit',tenant,(tx,a)=>createQuotation(tx,a,{rfqId,partyId,bookDate,validUntil:null,paymentTerm:'Net 30',deliveryDays:5,lines:[{itemId:item,quantity:'10',unitPrice}],supersedesId:null,...extra,commandId:randomUUID()},randomUUID()))
+
+    // Round one establishes the evidence that round two is compared against.
+    const firstRfq=await openRfq([vendor1,vendor2],'2026-04-01')
+    await quote(firstRfq.id,vendor1,'7000','2026-04-10')
+    await quote(firstRfq.id,vendor2,'7200','2026-04-10')
+
+    const secondRfq=await openRfq([vendor1,vendor2,vendor3],'2026-05-01')
+    await quote(secondRfq.id,vendor1,'7700','2026-05-05')
+    const superseded=await quote(secondRfq.id,vendor2,'7000','2026-05-05')
+    // The correction must replace the quote it names, so vendor2 ends on 6840 with revision 2.
+    await quote(secondRfq.id,vendor2,'6840','2026-05-05',{supersedesId:superseded.id})
+
+    // [IAM-002] A Unit-scoped reader compares without passing a Unit: scope is resolved from the RFQ.
+    const comparison=await withActor(db,'procurement-unit',tenant,(tx,a)=>compareQuotations(tx,a,{rfqId:secondRfq.id}))
+    expect(comparison.rfq).toMatchObject({id:secondRfq.id,number:secondRfq.number,unitId:unit})
+    expect(comparison.purchaseRequest?.status).toBe('submitted')
+
+    // [PROC-002] An invited Vendor that never quoted still appears, with nothing to show for a price.
+    const absent=comparison.vendors.find(vendor=>vendor.partyId===vendor3)
+    expect(absent).toMatchObject({invited:true,quotation:null,total:null,itemsPriced:0,itemsMissing:1})
+    expect(absent?.offers[0]).toMatchObject({unitPrice:null,historicalUnitPrice:null,priceDelta:null,priceDeltaPct:null})
+
+    // [PROC-003] Only the effective revision is compared, so the superseded 7000 cannot win.
+    const second=comparison.vendors.find(vendor=>vendor.partyId===vendor2)
+    expect(second).toMatchObject({invited:true,total:'68400',itemsPriced:1,itemsMissing:0})
+    expect(second?.quotation).toMatchObject({revision:2,revisionCount:2,paymentTerm:'Net 30',deliveryDays:5})
+    expect(second?.offers[0]).toMatchObject({unitPrice:'6840',amount:'68400'})
+
+    // [PROC-004] Historical price comes from the same Vendor on a different RFQ, with a real delta.
+    expect(second?.offers[0]).toMatchObject({historicalUnitPrice:'7200',historicalBookDate:'2026-04-10',priceDelta:'-360',priceDeltaPct:-5})
+    const first=comparison.vendors.find(vendor=>vendor.partyId===vendor1)
+    expect(first?.offers[0]).toMatchObject({unitPrice:'7700',historicalUnitPrice:'7000',priceDelta:'700',priceDeltaPct:10})
+
+    // [PROC-004] Item-level cheapest and total-level lowest are both stated, ties included.
+    expect(comparison.items).toHaveLength(1)
+    expect(comparison.items[0]).toMatchObject({code:'CMP-ITM-1',uom:'sak',cheapestUnitPrice:'6840',cheapestPartyIds:[vendor2]})
+    expect(comparison.summary).toMatchObject({vendors:3,quoted:2,revisions:1,lowestTotal:'68400',lowestTotalPartyIds:[vendor2],hasHistoricalPrices:true})
+
+    // [PROC-004] With no earlier RFQ there is no evidence, so history is absent rather than invented.
+    // The anchor is stated so a reader can see history only ever comes from before this comparison.
+    const noHistory=await withActor(db,'procurement-unit',tenant,(tx,a)=>compareQuotations(tx,a,{rfqId:firstRfq.id}))
+    expect(noHistory.summary).toMatchObject({hasHistoricalPrices:false,historicalAnchorDate:'2026-04-01'})
+    expect(noHistory.vendors.find(vendor=>vendor.partyId===vendor1)?.offers[0]).toMatchObject({unitPrice:'7000',historicalUnitPrice:null,historicalQuotationNumber:null,historicalBookDate:null,priceDelta:null,priceDeltaPct:null})
+
+    // Equal prices mark every tied Vendor as cheapest instead of picking one arbitrarily. Vendor 1
+    // reaches the tie through a revision, which also proves the highest revision is the effective one.
+    const vendor1First=comparison.vendors.find(vendor=>vendor.partyId===vendor1)!.quotation!
+    await quote(secondRfq.id,vendor1,'6840','2026-05-06',{supersedesId:vendor1First.id})
+    const tied=await withActor(db,'procurement-unit',tenant,(tx,a)=>compareQuotations(tx,a,{rfqId:secondRfq.id}))
+    expect(tied.items[0]?.cheapestUnitPrice).toBe('6840')
+    expect(tied.items[0]?.cheapestPartyIds.sort()).toEqual([vendor1,vendor2].sort())
+    expect(tied.summary.lowestTotalPartyIds.sort()).toEqual([vendor1,vendor2].sort())
+
+    // [PROC-004] A quotation may carry two lines for one item; the schema only forbids a repeated
+    // line number. The cell must then report a mixed rate instead of one of the two prices, while the
+    // total still sums every line.
+    const mixed=await withActor(db,'procurement-unit',tenant,(tx,a)=>createQuotation(tx,a,{rfqId:secondRfq.id,partyId:vendor3,bookDate:'2026-05-07',validUntil:null,
+      paymentTerm:'Net 14',deliveryDays:3,supersedesId:null,commandId:randomUUID(),
+      lines:[{itemId:item,quantity:'2',unitPrice:'5000'},{itemId:item,quantity:'3',unitPrice:'6000'}]},randomUUID()))
+    const mixedView=await withActor(db,'procurement-unit',tenant,(tx,a)=>compareQuotations(tx,a,{rfqId:secondRfq.id}))
+    const mixedVendor=mixedView.vendors.find(vendor=>vendor.partyId===vendor3)
+    expect(mixedVendor).toMatchObject({itemsPriced:0,itemsMissing:0,itemsMixed:1,total:'28000'})
+    expect(mixedVendor?.offers[0]).toMatchObject({unitPrice:null,mixedRate:true,quantity:'5',amount:'28000',priceDelta:null,priceDeltaPct:null})
+    // A mixed rate cannot be named cheapest, so vendor 2 keeps the item marker on its own.
+    expect(mixedView.items[0]).toMatchObject({cheapestUnitPrice:'6840',cheapestPartyIds:[vendor1,vendor2].sort()})
+
+    // [NFR-SEC-002] Another BUMDes cannot compare this RFQ, and a foreign RFQ is simply unavailable.
+    await expect(withActor(db,'user-b',B,(tx,a)=>compareQuotations(tx,a,{rfqId:secondRfq.id}))).rejects.toThrow('RFQ unavailable')
+    // A tenant-scoped reader needs no Unit parameter, which is why the admin path is exercised too.
+    expect((await withActor(db,'procurement-admin',tenant,(tx,a)=>compareQuotations(tx,a,{rfqId:secondRfq.id}))).summary.vendors).toBe(3)
+
+    // Every amount leaves the module as an exact string. A raw bigint cannot cross the JSON boundary,
+    // so serializing the response is asserted here rather than discovered as a 500 in production.
+    expect(()=>JSON.stringify(tied)).not.toThrow()
+    expect(JSON.parse(JSON.stringify(tied))).toMatchObject({summary:{lowestTotal:'68400'},items:[{cheapestUnitPrice:'6840'}]})
+    const serialized=JSON.stringify(tied)
+    expect(serialized).not.toContain('n,')
+    expect(serialized).not.toMatch(/:\s*\d+n/)
   })
 
 })
