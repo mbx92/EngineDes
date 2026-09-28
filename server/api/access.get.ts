@@ -15,4 +15,9 @@ export default defineEventHandler(event => authenticated(event, undefined, async
   canCreateUnit: can(actor, 'unit.create', actor.tenantId),
   canManageUsers: can(actor, 'account.manage', actor.tenantId),
   canUpdateOrganization: can(actor, 'organization.update', actor.tenantId),
+  // [MBX-8][CASH-001][BILL-001..003][PAY-001..003] Billing capabilities follow the Phase 2
+  // boundary: Admin configures, Finance posts inside assigned Unit scope.
+  canReadBilling: actor.grants.some(grant => !grant.locationId && can(actor,'financial.read',actor.tenantId,grant.unitId || undefined)),
+  canManageCashAccounts: can(actor,'financial.configure',actor.tenantId),
+  canPostBilling: actor.grants.some(grant => !grant.locationId && can(actor,'financial.post',actor.tenantId,grant.unitId || undefined)),
 })))
