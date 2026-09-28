@@ -184,7 +184,9 @@ export const payments = pgTable('payments', {
   unitId: uuid('unit_id').notNull(), locationId: uuid('location_id'), partyId: uuid('party_id').notNull(),
   cashAccountId: uuid('cash_account_id').notNull(), bookDate: date('book_date',{mode:'string'}).notNull(),
   amount: bigint('amount',{mode:'bigint'}).notNull(), allocated: bigint('allocated',{mode:'bigint'}).notNull(),
-  status: text('status').notNull().default('posted'), reason: text('reason'), reference: text('reference'), createdAt: created(),
+  status: text('status').notNull().default('posted'), reason: text('reason'), reference: text('reference'),
+  // [MBX-8][PAY-003] Void keeps the same actor/reason/reference evidence a document void keeps.
+  voidedAt: timestamp('voided_at',{withTimezone:true}), voidedBy: text('voided_by').references(() => user.id), createdAt: created(),
 }, t => [unique().on(t.tenantId,t.id), unique().on(t.tenantId,t.commandId), unique().on(t.tenantId,t.number),
   foreignKey({columns:[t.tenantId,t.unitId],foreignColumns:[units.tenantId,units.id]}),
   foreignKey({columns:[t.tenantId,t.unitId,t.locationId],foreignColumns:[locations.tenantId,locations.unitId,locations.id]}),
@@ -192,6 +194,8 @@ export const payments = pgTable('payments', {
   foreignKey({columns:[t.tenantId,t.cashAccountId],foreignColumns:[cashAccounts.tenantId,cashAccounts.id]}),
   check('payment_direction',sql`${t.direction} IN ('in','out')`),
   check('payment_status',sql`${t.status} IN ('posted','void')`),
+  // [MBX-8][PAY-003] A voided payment always names the actor who voided it, like a document.
+  check('payment_void',sql`(${t.status} = 'void') = (${t.voidedBy} IS NOT NULL)`),
   check('payment_amount',sql`${t.amount} > 0 AND ${t.allocated} >= 0 AND ${t.allocated} <= ${t.amount}`)])
 export const paymentAllocations = pgTable('payment_allocations', {
   id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull(),

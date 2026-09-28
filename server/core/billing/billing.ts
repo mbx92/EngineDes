@@ -1,12 +1,12 @@
 import { and, asc, desc, eq, sql } from 'drizzle-orm'
 import { z } from 'zod'
-import { cashAccounts, financialDocumentEvents, financialDocuments, ledgerAccounts, parties, partyRoles, paymentAllocations, payments, auditEvents } from '../../database/schema'
+import { cashAccounts, financialDocumentEvents, financialDocuments, journals, ledgerAccounts, parties, partyRoles, paymentAllocations, payments, auditEvents } from '../../database/schema'
 import type { Transaction } from '../../database/client'
 import { AccessDenied, requirePermission, type ActorAccess } from '../iam/access'
 import { lockAdministration, ManagementConflict } from '../iam/users'
 import { validateOrganizationContext } from '../governance/transaction-context'
 import { allocateNumber } from '../governance/numbering'
-import { bookDateInput, moneyInput, postBusinessEvent } from '../accounting/engine'
+import { bookDateInput, moneyInput, postBusinessEvent, reverseJournal } from '../accounting/engine'
 
 // [MBX-8][CASH-001] A cash/bank account is an operational entity bound to one ledger account.
 // It is never a second ledger and never carries debit/credit rules (ADR-001, MAP-002).
@@ -186,6 +186,33 @@ export async function listPayments(tx: Transaction, actor: ActorAccess, query: u
     .map(serializedPayment)
 }
 
+// [MBX-8][PAY-003][AUDIT-001] Void cancels a payment that has never been allocated. Once any
+// allocation exists the payment must be corrected through refund/reversal instead, mirroring
+// document void semantics: the database guard refuses it and the allocated history stays intact.
+// The original cash journal is reversed inside this transaction, so the accounting effect of the
+// cancellation is traceable rather than a silent status flip (ACC-003, NFR-DATA-002).
+export async function voidPayment(tx: Transaction, actor: ActorAccess, input: unknown, requestId: string) {
+  const data = z.object({
+    paymentId: z.uuid(), reason: z.string().trim().min(1).max(500),
+    reference: z.string().trim().max(120).nullable().default(null),
+    eventId: z.uuid(), reversalDate: bookDateInput,
+  }).strict().parse(input)
+  const [payment] = await tx.select().from(payments).where(and(eq(payments.tenantId, actor.tenantId), eq(payments.id, data.paymentId)))
+  if (!payment) throw new AccessDenied('Payment unavailable')
+  await lockAdministration(tx, actor, 'financial.post', payment.unitId, payment.locationId || undefined)
+  if (payment.status === 'void') throw new ManagementConflict('Pembayaran sudah dibatalkan.')
+  const [original] = await tx.select().from(journals).where(and(eq(journals.tenantId, actor.tenantId), eq(journals.eventId, payment.commandId)))
+  if (!original) throw new ManagementConflict('Jurnal asal pembayaran tidak ditemukan.')
+  await reverseJournal(tx, actor, { eventId: data.eventId, bookDate: data.reversalDate, originalJournalId: original.id }, requestId)
+  const [updated] = await tx.update(payments).set({
+    status: 'void', reason: data.reason, reference: data.reference, voidedAt: new Date(), voidedBy: actor.userId,
+  }).where(and(eq(payments.tenantId, actor.tenantId), eq(payments.id, payment.id))).returning()
+  await tx.insert(auditEvents).values({ tenantId: actor.tenantId, actorId: actor.userId, action: 'payment.voided', entityId: payment.id, requestId,
+    before: { status: payment.status, allocated: payment.allocated.toString(), journalId: original.id },
+    after: { status: 'void', reason: data.reason, reference: data.reference, reversalEventId: data.eventId, reversalDate: data.reversalDate } })
+  return serializedPayment(updated!)
+}
+
 // [MBX-8][PAY-001/002] Incoming cash settles receivables; outgoing cash settles payables.
 // Bounds and balance updates are enforced by the payment_allocation_guard trigger inside this
 // same transaction, so a concurrent caller cannot oversell the same outstanding balance.
@@ -199,6 +226,7 @@ export async function allocatePayment(tx: Transaction, actor: ActorAccess, input
   if (document.unitId !== payment.unitId) throw new AccessDenied('Payment and document must share a Unit')
   if (document.partyId !== payment.partyId) throw new AccessDenied('Payment and document must share a Party')
   if (payment.direction === 'in' ? document.type !== 'invoice' : document.type !== 'bill') throw new AccessDenied('Payment direction does not settle this document type')
+  if (payment.status !== 'posted') throw new ManagementConflict('Pembayaran tidak dalam status posted.')
   if (document.status !== 'open') throw new ManagementConflict('Dokumen tidak dalam status terbuka.')
   await tx.insert(paymentAllocations).values({ tenantId: actor.tenantId, paymentId: payment.id, documentId: document.id, amount: BigInt(data.amount), actorId: actor.userId })
   const [settled] = await tx.select({ outstanding: financialDocuments.outstanding, status: financialDocuments.status }).from(financialDocuments)
