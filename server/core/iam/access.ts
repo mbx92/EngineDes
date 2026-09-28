@@ -1,13 +1,13 @@
 // MBX-5 / IAM-001/002, ORG-002, NFR-SEC-001/002. Grants preserve role/scope pairing.
 export type Role = 'admin' | 'director' | 'finance' | 'unit_manager' | 'operator' | 'supervisor'
-export type Permission = 'unit.read' | 'unit.create' | 'account.revoke' | 'account.read' | 'account.create' | 'account.manage' | 'account.activation_link' | 'organization.update' | 'location.manage' | 'party.read' | 'party.manage' | 'configuration.manage' | 'audit.read' | 'transaction.context' | 'approval.authorize'
+export type Permission = 'unit.read' | 'unit.create' | 'account.revoke' | 'account.read' | 'account.create' | 'account.manage' | 'account.activation_link' | 'organization.update' | 'location.manage' | 'party.read' | 'party.manage' | 'configuration.manage' | 'audit.read' | 'transaction.context' | 'approval.authorize' | 'financial.read' | 'financial.post' | 'financial.configure' | 'period.close'
 export type Grant = { role: Role; scope: 'tenant' | 'unit'; unitId: string | null; locationId?: string | null }
 export interface ActorAccess { userId: string; tenantId: string; membershipId: string; grants: Grant[] }
 
 export class AccessDenied extends Error {}
 const permissions: Record<Role, readonly Permission[]> = {
-  admin: ['unit.read', 'unit.create', 'account.revoke', 'account.read', 'account.create', 'account.manage', 'account.activation_link', 'organization.update', 'location.manage', 'party.read', 'party.manage', 'configuration.manage', 'audit.read'],
-  director: ['unit.read', 'party.read', 'transaction.context', 'approval.authorize'], finance: ['unit.read', 'party.read', 'transaction.context'], unit_manager: ['unit.read', 'party.read', 'transaction.context'],
+  admin: ['unit.read', 'unit.create', 'account.revoke', 'account.read', 'account.create', 'account.manage', 'account.activation_link', 'organization.update', 'location.manage', 'party.read', 'party.manage', 'configuration.manage', 'audit.read', 'financial.configure', 'financial.read'],
+  director: ['unit.read', 'party.read', 'transaction.context', 'approval.authorize', 'financial.read', 'period.close'], finance: ['unit.read', 'party.read', 'transaction.context', 'financial.read', 'financial.post', 'period.close'], unit_manager: ['unit.read', 'party.read', 'transaction.context'],
   operator: ['unit.read', 'party.read', 'transaction.context'], supervisor: ['unit.read', 'party.read', 'audit.read'],
 }
 export function can(access: ActorAccess, permission: Permission, tenantId: string, unitId?: string, locationId?: string): boolean {
