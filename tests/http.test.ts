@@ -62,7 +62,9 @@ describe('[MBX-5][IAM-001/002] Nuxt HTTP boundary', async () => {
   })
   it('[MBX-9][PROC-001/002/003] protects procurement APIs at the HTTP boundary', async () => {
     const root='/api/tenants/00000000-0000-4000-8000-000000000001/procurement/'
-    for(const path of ['items','purchase-requests','rfqs','quotations']) {
+    // [MBX-10][PROC-004] The comparison read is protected like every other procurement read, and it
+    // deliberately has no mutation route: it is a computed view, not a document.
+    for(const path of ['items','purchase-requests','rfqs','quotations','comparison?rfqId=00000000-0000-4000-8000-000000000001']) {
       await expect($fetch(root+path)).rejects.toMatchObject({status:401})
     }
     for(const path of ['items','purchase-requests','rfqs','quotations','purchase-requests/submit','rfqs/vendors']) {

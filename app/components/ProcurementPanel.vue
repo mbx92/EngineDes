@@ -9,13 +9,24 @@ type Rfq = { id: string; number: string; purchaseRequestId: string; unitId: stri
 type Quotation = { id: string; number: string; rfqId: string; partyId: string; bookDate: string; validUntil: string | null; paymentTerm: string | null; deliveryDays: number | null; revision: number; supersedesId: string | null; lines: { itemId: string; quantity: string; unitPrice: string }[]; total: string }
 type Party = { id: string; name: string; roles: { role: string; unitId: string | null }[] }
 type Unit = { id: string; name: string }
+// [MBX-10][PROC-004] Comparison is a read model: a vendor's effective quotation, whether it was
+// invited, and its prior price for the same item when one exists.
+type Offer = { itemId: string; quantity: string | null; unitPrice: string | null; amount: string | null; mixedRate: boolean; historicalUnitPrice: string | null; historicalQuotationNumber: string | null; historicalBookDate: string | null; priceDelta: string | null; priceDeltaPct: number | null }
+type ComparisonVendor = { partyId: string; name: string; invited: boolean; total: string | null; itemsPriced: number; itemsMissing: number; itemsMixed: number; quotation: { id: string; number: string; revision: number; bookDate: string; validUntil: string | null; paymentTerm: string | null; deliveryDays: number | null; revisionCount: number } | null; offers: Offer[] }
+type Comparison = {
+  rfq: { id: string; number: string; unitId: string; bookDate: string; note: string | null }
+  purchaseRequest: { id: string; number: string; justification: string; status: string } | null
+  items: { itemId: string; code: string; name: string; uom: string; cheapestUnitPrice: string | null; cheapestPartyIds: string[] }[]
+  vendors: ComparisonVendor[]
+  summary: { vendors: number; quoted: number; revisions: number; lowestTotal: string | null; lowestTotalPartyIds: string[]; hasHistoricalPrices: boolean; historicalAnchorDate: string }
+}
 
 const props = defineProps<{ tenantId: string; canCreateRequest: boolean; canManageRfq: boolean; canQuote: boolean; canManageItems: boolean; canViewAll: boolean; assignedUnitIds: string[] }>()
 const root = computed(() => `/api/tenants/${props.tenantId}/procurement`)
-const allTabs = ['requests', 'rfq', 'quotations', 'items'] as const
+const allTabs = ['requests', 'rfq', 'quotations', 'comparison', 'items'] as const
 type Tab = (typeof allTabs)[number]
 const tabs = computed<readonly Tab[]>(() => props.canManageItems ? allTabs : allTabs.filter(tab => tab !== 'items'))
-const tabLabels = { requests: 'Permintaan Pembelian', rfq: 'RFQ Vendor', quotations: 'Penawaran', items: 'Item & Jasa' }
+const tabLabels = { requests: 'Permintaan Pembelian', rfq: 'RFQ Vendor', quotations: 'Penawaran', comparison: 'Perbandingan Vendor', items: 'Item & Jasa' }
 const activeTab = ref<Tab>('requests'), tabId = useId()
 const statusLabels: Record<string, string> = { draft: 'Draf', submitted: 'Diajukan' }
 const kindLabels: Record<string, string> = { item: 'Barang', service: 'Jasa' }
@@ -26,6 +37,8 @@ const busy = ref(false), message = ref(''), success = ref(false)
 // [MBX-9][IAM-002] Reads are scoped to a Unit: a unit-scoped procurement grant cannot read a
 // tenant-wide list, so the panel always sends a Unit it is actually assigned to.
 const filterUnit = ref('')
+// [MBX-10][PROC-004] The comparison is per RFQ: the operator picks which RFQ to compare.
+const comparisonRfqId = ref(''), comparison = ref<Comparison | null>(null)
 
 const itemForm = ref({ unitId: '', code: '', name: '', kind: 'item', uom: 'pcs' })
 const requestForm = ref({ unitId: '', bookDate: today(), justification: '', lines: [{ itemId: '', quantity: '1' }] })
@@ -49,6 +62,10 @@ const invitedVendors = computed(() => {
 })
 const itemOptions = (unitId: string) => items.value.filter(item => item.active && (!item.unitId || item.unitId === unitId))
 const quotationTotal = computed(() => quotationForm.value.lines.reduce((sum, line) => sum + (BigInt(line.quantity || '0') * BigInt(line.unitPrice || '0')), 0n).toString())
+// [MBX-10][PROC-004] Comparison cells are keyed by (vendor, item); keeping the lookup here avoids
+// repeating it four times per cell in the template.
+const offerFor = (vendor: ComparisonVendor, itemId: string) => vendor.offers.find(offer => offer.itemId === itemId)
+const offerQty = (itemId: string) => comparison.value?.vendors.map(vendor => offerFor(vendor, itemId)?.quantity).find(value => value) || '—'
 
 function navigateTabs(event: KeyboardEvent) {
   const index = tabs.value.indexOf(activeTab.value)
@@ -85,8 +102,20 @@ async function load() {
     quotations.value = await $fetch<Quotation[]>(root.value + '/quotations', { query: scoped })
     if (!requestForm.value.unitId) requestForm.value.unitId = units.value[0]?.id || ''
     if (!itemForm.value.unitId) itemForm.value.unitId = ''
+    // Keep the compared RFQ valid after a Unit filter change, otherwise the read would point at a
+    // Unit the actor can no longer read.
+    if (!rfqs.value.some(rfq => rfq.id === comparisonRfqId.value)) comparisonRfqId.value = rfqs.value[0]?.id || ''
+    await loadComparison()
   } catch { message.value = 'Data pengadaan belum dapat dimuat.'; success.value = false }
   finally { busy.value = false }
+}
+
+// [MBX-10][PROC-004] Loading the comparison is independent of the write commands, so a failed read
+// never overwrites a success message from a save.
+async function loadComparison() {
+  if (!comparisonRfqId.value) { comparison.value = null; return }
+  try { comparison.value = await $fetch<Comparison>(root.value + '/comparison', { query: { rfqId: comparisonRfqId.value } }) }
+  catch { comparison.value = null }
 }
 
 async function save(task: () => Promise<unknown>, confirmation: string) {
@@ -150,7 +179,7 @@ onMounted(load)
     </div>
     <p v-if="message" :class="['notice', success ? 'success' : 'error']" :role="success ? 'status' : 'alert'">{{ message }}</p>
     <div class="procurement-tabs" role="tablist" aria-label="Bagian pengadaan">
-      <button v-for="tab in tabs" :id="`${tabId}-${tab}-tab`" :key="tab" type="button" role="tab" :aria-selected="activeTab === tab" :aria-controls="`${tabId}-${tab}-panel`" :tabindex="activeTab === tab ? 0 : -1" @click="activeTab = tab" @keydown="navigateTabs"><AppIcon :name="tab === 'items' ? 'tag' : tab === 'rfq' ? 'cart' : tab === 'quotations' ? 'layers' : 'check'" :size="17" />{{ tabLabels[tab] }}</button>
+      <button v-for="tab in tabs" :id="`${tabId}-${tab}-tab`" :key="tab" type="button" role="tab" :aria-selected="activeTab === tab" :aria-controls="`${tabId}-${tab}-panel`" :tabindex="activeTab === tab ? 0 : -1" @click="activeTab = tab" @keydown="navigateTabs"><AppIcon :name="tab === 'items' ? 'tag' : tab === 'rfq' ? 'cart' : tab === 'quotations' ? 'layers' : tab === 'comparison' ? 'search' : 'check'" :size="17" />{{ tabLabels[tab] }}</button>
       <button class="procurement-reload" type="button" :disabled="busy" aria-label="Muat ulang data pengadaan" @click="load"><AppIcon name="refresh" :size="16" /><span>Muat ulang</span></button>
     </div>
     <div class="procurement-filter">
@@ -227,6 +256,56 @@ onMounted(load)
       </aside>
     </div>
 
+    <div v-show="activeTab === 'comparison'" :id="`${tabId}-comparison-panel`" class="procurement-layout single" role="tabpanel" :aria-labelledby="`${tabId}-comparison-tab`" tabindex="0">
+      <section class="panel procurement-main-card">
+        <div class="panel-heading"><div><h2>Perbandingan vendor</h2><p>Penawaran efektif per vendor untuk satu RFQ: harga item, total, pengiriman, termin, dan harga historis bila datanya ada. Revisi terbaru yang dibandingkan, dan riwayat harga yang belum ada ditandai eksplisit.</p></div>
+          <label class="field comparison-picker">RFQ<select v-model="comparisonRfqId" :disabled="busy" @change="loadComparison"><option value="">Pilih RFQ</option><option v-for="rfq in rfqs" :key="rfq.id" :value="rfq.id">{{ rfq.number }} · {{ unitName(rfq.unitId) }}</option></select></label>
+        </div>
+        <div v-if="!comparison" class="empty-state"><h3>Belum ada yang dibandingkan</h3><p>Pilih RFQ yang sudah memiliki penawaran vendor.</p></div>
+        <template v-else>
+          <div class="comparison-summary">
+            <div><strong>{{ comparison.summary.quoted }}/{{ comparison.summary.vendors }}</strong><span>Vendor menawar</span></div>
+            <div><strong>{{ comparison.summary.revisions }}</strong><span>Penawaran direvisi</span></div>
+            <div><strong>{{ comparison.summary.lowestTotal ? 'Rp ' + idr(comparison.summary.lowestTotal) : '—' }}</strong><span>Total terendah</span></div>
+            <div><strong>{{ comparison.summary.hasHistoricalPrices ? 'Ada' : 'Belum ada' }}</strong><span>Riwayat harga</span></div>
+          </div>
+          <p v-if="comparison.purchaseRequest" class="hint">Dari permintaan <strong>{{ comparison.purchaseRequest.number }}</strong> · {{ comparison.purchaseRequest.justification }}</p>
+          <!-- [MBX-10][PROC-004] "Belum ada" is stated, never rendered as a zero or an empty column
+               that could be read as a price of nothing. -->
+          <p v-if="!comparison.summary.hasHistoricalPrices" class="comparison-note">Belum ada riwayat harga untuk vendor-vendor ini pada RFQ lain, jadi kolom harga historis dibiarkan kosong.</p>
+          <div v-if="!comparison.vendors.length" class="empty-state"><h3>RFQ belum punya vendor</h3><p>Undang vendor pada RFQ ini terlebih dahulu.</p></div>
+          <div v-else class="table-scroll"><table class="comparison-table">
+            <thead><tr><th class="comparison-sticky">Item</th><th class="number-column">Qty</th><th v-for="vendor in comparison.vendors" :key="vendor.partyId" class="number-column vendor-column"><span>{{ vendor.name }}</span><small v-if="!vendor.invited" class="muted">tidak diundang</small><small v-else-if="!vendor.quotation" class="muted">belum menawar</small><small v-else class="muted">rev {{ vendor.quotation.revision }} dari {{ vendor.quotation.revisionCount }}</small><small v-if="vendor.quotation" class="muted">kirim {{ vendor.quotation.deliveryDays ?? '—' }} hari · {{ vendor.quotation.paymentTerm || 'tanpa termin' }}</small></th></tr></thead>
+            <tbody>
+              <tr v-for="item in comparison.items" :key="item.itemId">
+                <td class="comparison-sticky"><strong>{{ item.name }}</strong><small>{{ item.code }} · {{ item.uom }}</small></td>
+                <td class="number-column">{{ offerQty(item.itemId) }}</td>
+                <td v-for="vendor in comparison.vendors" :key="vendor.partyId" class="number-column" :class="{ cheapest: item.cheapestPartyIds.includes(vendor.partyId) }">
+                  <template v-if="offerFor(vendor, item.itemId)">
+                    <template v-if="offerFor(vendor, item.itemId)!.unitPrice">
+                      <span class="price">{{ idr(offerFor(vendor, item.itemId)!.unitPrice!) }}</span>
+                      <span v-if="item.cheapestPartyIds.includes(vendor.partyId)" class="cheapest-flag">termurah</span>
+                    </template>
+                    <!-- A mixed rate has no single price, so the cell shows the line total and says so
+                         rather than presenting one of the two rates as if it were the whole quote. -->
+                    <template v-else><span class="price">{{ idr(offerFor(vendor, item.itemId)!.amount!) }}</span><span class="cheapest-flag mixed">harga campuran</span></template>
+                    <!-- [MBX-10][PROC-004] A prior price is shown only when it exists; otherwise the
+                         cell states that there is no history instead of implying one. -->
+                    <small v-if="offerFor(vendor, item.itemId)!.historicalUnitPrice" class="history-line">sebelumnya {{ idr(offerFor(vendor, item.itemId)!.historicalUnitPrice!) }} ({{ offerFor(vendor, item.itemId)!.historicalBookDate }})<span :class="['delta', (offerFor(vendor, item.itemId)!.priceDeltaPct ?? 0) > 0 ? 'up' : (offerFor(vendor, item.itemId)!.priceDeltaPct ?? 0) < 0 ? 'down' : 'flat']">{{ (offerFor(vendor, item.itemId)!.priceDeltaPct ?? 0) > 0 ? '+' : '' }}{{ offerFor(vendor, item.itemId)!.priceDeltaPct ?? 0 }}%</span></small>
+                    <small v-else class="muted">tanpa riwayat harga</small>
+                  </template>
+                  <span v-else class="muted">—</span>
+                </td>
+              </tr>
+              <tr class="comparison-total"><td class="comparison-sticky"><strong>Total penawaran</strong></td><td></td>
+                <td v-for="vendor in comparison.vendors" :key="vendor.partyId" class="number-column" :class="{ cheapest: comparison.summary.lowestTotalPartyIds.includes(vendor.partyId) }"><strong v-if="vendor.total">{{ idr(vendor.total) }}</strong><span v-else class="muted">belum menawar</span><small v-if="vendor.itemsMissing" class="muted">{{ vendor.itemsMissing }} item belum dihargai</small></td>
+              </tr>
+            </tbody>
+          </table></div>
+        </template>
+      </section>
+    </div>
+
     <div v-show="activeTab === 'items'" :id="`${tabId}-items-panel`" class="procurement-layout" role="tabpanel" :aria-labelledby="`${tabId}-items-tab`" tabindex="0">
       <section class="panel procurement-main-card">
         <div class="panel-heading"><div><h2>Item &amp; jasa</h2><p>Item milik seluruh BUMDes bila Unit dikosongkan; item juga dapat dibatasi pada satu Unit.</p></div><span class="count-badge">{{ items.length }} item</span></div>
@@ -294,7 +373,26 @@ onMounted(load)
 .number-column{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .link-button{border:0;background:transparent;color:#2f6ea8;font-size:11px;font-weight:600}
 .link-button:hover:not(:disabled){text-decoration:underline}
+.procurement-layout.single{grid-template-columns:minmax(0,1fr)}
+.comparison-picker{min-width:240px;margin:0}
+.comparison-summary{display:flex;flex-wrap:wrap;gap:22px;padding:16px 0}
+.comparison-summary>div{display:grid;gap:2px;min-width:96px}
+.comparison-summary strong{font-size:16px;color:#243146}
+.comparison-summary span{font-size:10px;color:#8d99a8}
+.comparison-note{margin:0 0 14px;padding:11px 14px;border:1px solid #ecd9b4;border-radius:9px;background:#fdf7ea;color:#8a6d33;font-size:11px}
+.comparison-table th.vendor-column>span{display:block;font-size:11px;color:#526176;text-transform:none;letter-spacing:0}
+.comparison-table small{display:block;margin-top:3px;font-size:10px;font-weight:500}
+.comparison-table td.comparison-sticky small,.comparison-table th.comparison-sticky small{display:block;color:#8d99a8;font-weight:400}
+.comparison-table td.cheapest,.comparison-table tr.comparison-total td.cheapest{background:#eef7f1}
+.comparison-table td small.history-line{margin-top:5px;color:#5c6b7f}
+.comparison-table td small.history-line .delta{margin-left:5px;font-weight:700}
+.delta.up{color:#a8552f}
+.delta.down{color:#2f7a4f}
+.delta.flat{color:#78859a}
+.cheapest-flag{display:inline-flex;margin-top:4px;padding:3px 6px;border-radius:999px;background:#dbeee3;color:#2f7a4f;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.comparison-table .muted{color:#98a4b2}
+.comparison-table tr.comparison-total td{border-top:2px solid #e6ecf0;background:#f8fafb}
 .procurement-page [role="tabpanel"]:focus{outline:none}
 @media(max-width:1050px){.procurement-overview{align-items:flex-start;flex-direction:column}.procurement-summary{width:100%;flex-wrap:wrap}.procurement-layout{grid-template-columns:1fr}}
-@media(max-width:650px){.procurement-overview{padding:18px}.procurement-tabs{gap:18px}.procurement-tabs .procurement-reload{margin-left:0}.procurement-reload span{display:none}.form-pair,.line-editor,.quotation-line{grid-template-columns:1fr}.quotation-line .line-remove,.line-editor .line-remove{justify-self:start;margin-bottom:0}.procurement-action-card{padding:18px}.procurement-main-card table{min-width:680px}}
+@media(max-width:650px){.procurement-overview{padding:18px}.procurement-tabs{gap:18px}.procurement-tabs .procurement-reload{margin-left:0}.procurement-reload span{display:none}.form-pair,.line-editor,.quotation-line{grid-template-columns:1fr}.quotation-line .line-remove,.line-editor .line-remove{justify-self:start;margin-bottom:0}.procurement-action-card{padding:18px}.procurement-main-card table{min-width:680px}.comparison-picker{min-width:0;width:100%}.panel-heading{flex-direction:column;align-items:flex-start;gap:12px}}
 </style>
