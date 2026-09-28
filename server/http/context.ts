@@ -17,6 +17,18 @@ export function requireSameOrigin(event: H3Event) {
     throw createError({ statusCode: 403, statusMessage: 'Origin denied' })
   }
 }
+// [MBX-8][BILL-001][PAY-001..003] PostgreSQL guards raise P0001 with an authored domain message
+// (for example "Void is not permitted once allocations exist"). These are business-rule refusals,
+// not server faults, so they must map to 409 rather than surfacing as a 500.
+// Exported so the mapping is unit-testable without standing up a database.
+export function domainConflictMessage(error: unknown): string | null {
+  const wrapped = error as { code?: string; cause?: { code?: string; message?: string } }
+  if (wrapped?.code !== 'P0001' && wrapped?.cause?.code !== 'P0001') return null
+  const message = wrapped.cause?.message || ''
+  // Only echo text that looks like an authored sentence; never leak raw constraint internals.
+  return /^[A-Z][A-Za-z0-9 ,.'-]{4,160}$/.test(message) ? message : 'Permintaan melanggar aturan data.'
+}
+
 export async function authenticated<T>(event: H3Event, tenantId: string | undefined,
   operation: (tx: Transaction, actor: ActorAccess) => Promise<T>): Promise<T> {
   if (tenantId && !z.uuid().safeParse(tenantId).success) throw createError({ statusCode: 400, statusMessage: 'Invalid tenant identifier' })
@@ -36,6 +48,8 @@ export async function authenticated<T>(event: H3Event, tenantId: string | undefi
     // PostgreSQL unique violation, including errors wrapped by Drizzle.
     const cause = error as { code?: string; cause?: { code?: string } }
     if (cause.code === '23505' || cause.cause?.code === '23505') throw createError({ statusCode: 409, statusMessage: 'Record already exists' })
+    const conflict = domainConflictMessage(error)
+    if (conflict) throw createError({ statusCode: 409, statusMessage: conflict })
     throw error
   }
 }

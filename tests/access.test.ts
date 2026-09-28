@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { can, readableUnits, requirePermission, type ActorAccess } from '../server/core/iam/access'
+import { domainConflictMessage } from '../server/http/context'
 
 const access: ActorAccess = { userId: 'user', tenantId: 'A', membershipId: 'member', grants: [
   { role: 'admin', scope: 'unit', unitId: 'A1' },
@@ -34,5 +35,21 @@ describe('[MBX-5][IAM-001/002][ORG-002] paired role and scope', () => {
     const admin = { ...access, grants: [{ role: 'admin' as const, scope: 'tenant' as const, unitId: null }] }
     expect(can(admin, 'account.activation_link', 'A')).toBe(true)
     expect(can(admin, 'account.activation_link', 'B')).toBe(false)
+  })
+})
+
+describe('[MBX-8][BILL-001][PAY-003] database guard refusals map to a client conflict', () => {
+  it('maps a wrapped P0001 authored message instead of surfacing a 500', () => {
+    expect(domainConflictMessage({ code: 'P0001', cause: { code: 'P0001', message: 'Void is not permitted once allocations exist' } }))
+      .toBe('Void is not permitted once allocations exist')
+    // Drizzle surfaces the driver error one level deeper; both shapes must be recognised.
+    expect(domainConflictMessage({ cause: { code: 'P0001', message: 'Allocation exceeds document outstanding' } }))
+      .toBe('Allocation exceeds document outstanding')
+  })
+  it('does not echo unrecognised constraint text and ignores unrelated errors', () => {
+    expect(domainConflictMessage({ code: 'P0001', cause: { code: 'P0001', message: 'constraint "x" of relation "y" violates' } }))
+      .toBe('Permintaan melanggar aturan data.')
+    expect(domainConflictMessage({ code: '23505' })).toBeNull()
+    expect(domainConflictMessage(new Error('boom'))).toBeNull()
   })
 })
