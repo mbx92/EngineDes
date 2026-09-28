@@ -17,6 +17,9 @@ const paths: Record<string, string> = {
   lock: 'M6 11h12v10H6z M8 11V7a4 4 0 0 1 8 0v4',
   layers: 'M12 3l10 6-10 6L2 9z M2 13l10 6 10-6 M2 17l10 6 10-6',
   clock: 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0 M12 7v5l3 2',
+  // [MBX-9][PROC-001..003] Procurement navigation and item master data.
+  cart: 'M3 4h2l2.4 11h11l2-8H6 M9 20a1 1 0 1 0 0-.01 M18 20a1 1 0 1 0 0-.01',
+  tag: 'M3 12V4h8l10 10-8 8z M7.5 7.5h.01',
 }
 </script>
 <template><svg :width="size" :height="size" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path :d="paths[name] || paths.grid" /></svg></template>

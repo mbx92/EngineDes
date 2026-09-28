@@ -8,7 +8,7 @@ import { createLocation } from '../organization/locations'
 import { saveParty } from '../party/parties'
 import { setConfiguration, readConfiguration } from './configuration'
 import { createLedgerAccount, setAccountingMapping } from '../accounting/engine'
-import { units, locations, parties, user, memberships, ledgerAccounts, accountingMappings } from '../../database/schema'
+import { units, locations, parties, user, memberships, ledgerAccounts, accountingMappings, items } from '../../database/schema'
 // [MBX-5][ORG-001/002][PARTY-001/002] Explicit local seed; no demo credentials/financial writes.
 
 // [MBX-8][MAP-001..004] Billing posts four distinct events and each must be mapped before any
@@ -38,6 +38,21 @@ const billingMappings = [
   // against receivables, cash paid is debited back against payables. No clearing account.
   { eventType: 'sales_refund', debit: 'DEMO-1200', credit: 'DEMO-1100' },
   { eventType: 'purchase_refund', debit: 'DEMO-1100', credit: 'DEMO-2100' },
+] as const
+// [MBX-9][SEQ-001] Procurement source documents are numbered too, so a fresh install can raise a
+// PR/RFQ/quotation immediately. Like billing they carry a `YYYY-MM` period, so the counter resets
+// per month. No procurement event is mapped: procurement posts nothing (ADR-001/003, MAP-001..004).
+const procurementSequences = [
+  { key: 'sequence:purchase_request', value: { prefix: 'DEMO-PR', scope: 'tenant', reset: 'month' } },
+  { key: 'sequence:rfq', value: { prefix: 'DEMO-RFQ', scope: 'tenant', reset: 'month' } },
+  { key: 'sequence:vendor_quotation', value: { prefix: 'DEMO-QUO', scope: 'tenant', reset: 'month' } },
+] as const
+// [MBX-9][PROC-001/PROC-003] Sample item/service master data, BUMDes-level so vendor price history
+// can span Unit Usaha. It is master data only; the seed posts nothing and fabricates no quotation.
+const procurementItems = [
+  { code: 'DEMO-ITM-01', name: 'DEMO · Beras Premium 25kg', kind: 'item' as const, uom: 'sak' },
+  { code: 'DEMO-ITM-02', name: 'DEMO · Pupuk Urea 50kg', kind: 'item' as const, uom: 'sak' },
+  { code: 'DEMO-SVC-01', name: 'DEMO · Jasa Angkut', kind: 'service' as const, uom: 'trip' },
 ] as const
 export async function seedDummy(db: Database, actorId: string, tenantId: string) {
   return withActor(db,actorId,tenantId,async (tx,actor) => {
@@ -75,8 +90,16 @@ export async function seedDummy(db: Database, actorId: string, tenantId: string)
         if(existing.name!==name || !member)throw new Error('DEMO email collision; existing identity preserved')
       }
     }
-    for(const [key,value] of [['customer:demo_cash',{anonymousAllowed:true}],['sequence:demo_cash',{prefix:'DEMO',scope:'tenant',reset:'never'}],...billingSequences.map(sequence=>[sequence.key,sequence.value] as const)] as const) {
+    for(const [key,value] of [['customer:demo_cash',{anonymousAllowed:true}],['sequence:demo_cash',{prefix:'DEMO',scope:'tenant',reset:'never'}],...billingSequences.map(sequence=>[sequence.key,sequence.value] as const),...procurementSequences.map(sequence=>[sequence.key,sequence.value] as const)] as const) {
       if(!await readConfiguration(tx,tenantId,key)){await setConfiguration(tx,actor,{key,value,expectedRevision:0},randomUUID());created++}
+    }
+    // [MBX-9][PROC-001/PROC-003] Item master data must exist before a PR or quotation line can
+    // reference it. Items are inserted directly here: this seed already runs as a locked
+    // administrator, and item identity is not a financial fact.
+    for(const item of procurementItems){
+      const existing=(await tx.select().from(items).where(and(eq(items.tenantId,tenantId),eq(items.code,item.code))))[0]
+      if(!existing){await tx.insert(items).values({...item,tenantId,unitId:null,actorId:actor.userId});created++}
+      else if(existing.name!==item.name||existing.kind!==item.kind)throw new Error('DEMO item code collision')
     }
     // [MBX-6/7] Sample chart and mapping only; never fabricate posted financial balances.
     // [MBX-8] The chart now covers the events billing actually emits, so a fresh install can
@@ -109,6 +132,6 @@ export async function seedDummy(db: Database, actorId: string, tenantId: string)
         {accountId:codeOf(mapping.credit),side:'credit',amountKey:'total',unitDimension:'event_unit'}]},randomUUID())
       created++
     }
-    return { created, units:3, locations:6, parties:5, pendingUsers:3, ledgerAccounts:financeAccounts.length, accountingMappings:1+billingMappings.length, billingSequences:billingSequences.length }
+    return { created, units:3, locations:6, parties:5, pendingUsers:3, ledgerAccounts:financeAccounts.length, accountingMappings:1+billingMappings.length, billingSequences:billingSequences.length, procurementSequences:procurementSequences.length, procurementItems:procurementItems.length }
   })
 }

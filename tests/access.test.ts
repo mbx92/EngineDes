@@ -29,7 +29,7 @@ describe('[MBX-5][IAM-001/002][ORG-002] paired role and scope', () => {
   })
   it('allows direct activation links only for a tenant-scoped admin', () => {
     expect(can(access, 'account.activation_link', 'A')).toBe(false)
-    for (const role of ['director', 'finance', 'unit_manager', 'operator', 'supervisor'] as const) {
+    for (const role of ['director', 'finance', 'unit_manager', 'operator', 'procurement', 'supervisor'] as const) {
       expect(can({ ...access, grants: [{ role, scope: 'tenant', unitId: null }] }, 'account.activation_link', 'A')).toBe(false)
     }
     const admin = { ...access, grants: [{ role: 'admin' as const, scope: 'tenant' as const, unitId: null }] }

@@ -1,14 +1,19 @@
 // MBX-5 / IAM-001/002, ORG-002, NFR-SEC-001/002. Grants preserve role/scope pairing.
-export type Role = 'admin' | 'director' | 'finance' | 'unit_manager' | 'operator' | 'supervisor'
-export type Permission = 'unit.read' | 'unit.create' | 'account.revoke' | 'account.read' | 'account.create' | 'account.manage' | 'account.activation_link' | 'organization.update' | 'location.manage' | 'party.read' | 'party.manage' | 'configuration.manage' | 'audit.read' | 'transaction.context' | 'approval.authorize' | 'financial.read' | 'financial.post' | 'financial.configure' | 'period.close'
+export type Role = 'admin' | 'director' | 'finance' | 'unit_manager' | 'operator' | 'procurement' | 'supervisor'
+export type Permission = 'unit.read' | 'unit.create' | 'account.revoke' | 'account.read' | 'account.create' | 'account.manage' | 'account.activation_link' | 'organization.update' | 'location.manage' | 'party.read' | 'party.manage' | 'configuration.manage' | 'audit.read' | 'transaction.context' | 'approval.authorize' | 'financial.read' | 'financial.post' | 'financial.configure' | 'period.close' | 'procurement.read' | 'purchase_request.create' | 'rfq.create' | 'quotation.create'
 export type Grant = { role: Role; scope: 'tenant' | 'unit'; unitId: string | null; locationId?: string | null }
 export interface ActorAccess { userId: string; tenantId: string; membershipId: string; grants: Grant[] }
 
 export class AccessDenied extends Error {}
+// [MBX-9][IAM-001/002] Procurement follows the Personas page: Kepala Unit may raise a PR inside
+// assigned Unit Usaha, and the `procurement` persona also runs RFQ/quotation. Visibility
+// (procurement.read) is separate from the create actions, so a read-only Pengawas is possible.
 const permissions: Record<Role, readonly Permission[]> = {
-  admin: ['unit.read', 'unit.create', 'account.revoke', 'account.read', 'account.create', 'account.manage', 'account.activation_link', 'organization.update', 'location.manage', 'party.read', 'party.manage', 'configuration.manage', 'audit.read', 'financial.configure', 'financial.read'],
-  director: ['unit.read', 'party.read', 'transaction.context', 'approval.authorize', 'financial.read', 'period.close'], finance: ['unit.read', 'party.read', 'transaction.context', 'financial.read', 'financial.post', 'period.close'], unit_manager: ['unit.read', 'party.read', 'transaction.context'],
-  operator: ['unit.read', 'party.read', 'transaction.context'], supervisor: ['unit.read', 'party.read', 'audit.read'],
+  admin: ['unit.read', 'unit.create', 'account.revoke', 'account.read', 'account.create', 'account.manage', 'account.activation_link', 'organization.update', 'location.manage', 'party.read', 'party.manage', 'configuration.manage', 'audit.read', 'financial.configure', 'financial.read', 'procurement.read'],
+  director: ['unit.read', 'party.read', 'transaction.context', 'approval.authorize', 'financial.read', 'period.close', 'procurement.read'], finance: ['unit.read', 'party.read', 'transaction.context', 'financial.read', 'financial.post', 'period.close'],
+  unit_manager: ['unit.read', 'party.read', 'transaction.context', 'procurement.read', 'purchase_request.create'], operator: ['unit.read', 'party.read', 'transaction.context'],
+  procurement: ['unit.read', 'party.read', 'transaction.context', 'procurement.read', 'purchase_request.create', 'rfq.create', 'quotation.create'],
+  supervisor: ['unit.read', 'party.read', 'audit.read', 'procurement.read'],
 }
 export function can(access: ActorAccess, permission: Permission, tenantId: string, unitId?: string, locationId?: string): boolean {
   if (access.tenantId !== tenantId) return false

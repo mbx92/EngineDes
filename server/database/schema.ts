@@ -27,7 +27,8 @@ export const verification = pgTable('auth_verification', {
   id: text('id').primaryKey(), identifier: text('identifier').notNull(), value: text('value').notNull(),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(), createdAt: created(), updatedAt: updated(),
 })
-export const roleNames = ['admin', 'director', 'finance', 'unit_manager', 'operator', 'supervisor'] as const
+// [MBX-9][IAM-001/002] `procurement` is the Personas-page Procurement persona; MBX-11 inherits it.
+export const roleNames = ['admin', 'director', 'finance', 'unit_manager', 'operator', 'procurement', 'supervisor'] as const
 export const roleEnum = pgEnum('role_name', roleNames)
 export const scopeEnum = pgEnum('access_scope', ['tenant', 'unit'])
 export const tenants = pgTable('tenants', {
@@ -219,3 +220,85 @@ export const paymentRefunds = pgTable('payment_refunds', {
   foreignKey({columns:[t.tenantId,t.documentId],foreignColumns:[financialDocuments.tenantId,financialDocuments.id]}),
   unique().on(t.tenantId,t.commandId),
   check('payment_refund_amount',sql`${t.amount} > 0`)])
+
+// [MBX-9][PROC-001][PROC-003][PROC-004] A purchasable item/service is an identity, not free text on
+// each line: price comparison and historical price must compare the same thing across vendors.
+// It is BUMDes-level by default (nullable Unit) so vendor history can span Unit Usaha; a Unit may
+// still own private items. Master data is append-only here, so no edit path exists yet.
+export const items = pgTable('items', {
+  id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
+  unitId: uuid('unit_id'), code: text('code').notNull(), name: text('name').notNull(),
+  kind: text('kind').notNull(), uom: text('uom').notNull(), active: boolean('active').notNull().default(true),
+  actorId: text('actor_id').notNull().references(() => user.id), createdAt: created(),
+}, t => [unique().on(t.tenantId,t.id), unique().on(t.tenantId,t.code),
+  foreignKey({columns:[t.tenantId,t.unitId],foreignColumns:[units.tenantId,units.id]}),
+  check('item_kind',sql`${t.kind} IN ('item','service')`)])
+// [MBX-9][PROC-001] Purchase Request. Status deliberately stops at `submitted`: approval policy
+// (WF-001, IAM-003) is MBX-11, so this slice must not appear to gate on approval it does not have.
+export const purchaseRequests = pgTable('purchase_requests', {
+  id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
+  number: text('number').notNull(), commandId: uuid('command_id').notNull(),
+  unitId: uuid('unit_id').notNull(), locationId: uuid('location_id'),
+  requestedBy: text('requested_by').notNull().references(() => user.id),
+  bookDate: date('book_date',{mode:'string'}).notNull(), justification: text('justification').notNull(),
+  status: text('status').notNull().default('draft'),
+  submittedAt: timestamp('submitted_at',{withTimezone:true}), submittedBy: text('submitted_by').references(() => user.id),
+  createdAt: created(),
+}, t => [unique().on(t.tenantId,t.id), unique().on(t.tenantId,t.commandId), unique().on(t.tenantId,t.number),
+  foreignKey({columns:[t.tenantId,t.unitId],foreignColumns:[units.tenantId,units.id]}),
+  foreignKey({columns:[t.tenantId,t.unitId,t.locationId],foreignColumns:[locations.tenantId,locations.unitId,locations.id]}),
+  check('purchase_request_status',sql`${t.status} IN ('draft','submitted')`),
+  check('purchase_request_submission',sql`(${t.status} = 'submitted') = (${t.submittedBy} IS NOT NULL AND ${t.submittedAt} IS NOT NULL)`)])
+export const purchaseRequestLines = pgTable('purchase_request_lines', {
+  id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull(),
+  purchaseRequestId: uuid('purchase_request_id').notNull(), lineNo: integer('line_no').notNull(),
+  itemId: uuid('item_id').notNull(), quantity: bigint('quantity',{mode:'bigint'}).notNull(), createdAt: created(),
+}, t => [unique().on(t.tenantId,t.purchaseRequestId,t.lineNo),
+  foreignKey({columns:[t.tenantId,t.purchaseRequestId],foreignColumns:[purchaseRequests.tenantId,purchaseRequests.id]}),
+  foreignKey({columns:[t.tenantId,t.itemId],foreignColumns:[items.tenantId,items.id]}),
+  check('purchase_request_line_no',sql`${t.lineNo} > 0`), check('purchase_request_line_quantity',sql`${t.quantity} > 0`)])
+// [MBX-9][PROC-002] One RFQ addressed to several Vendor Parties; a PR may raise more than one RFQ.
+export const rfqs = pgTable('rfqs', {
+  id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
+  number: text('number').notNull(), commandId: uuid('command_id').notNull(),
+  purchaseRequestId: uuid('purchase_request_id').notNull(), unitId: uuid('unit_id').notNull(),
+  bookDate: date('book_date',{mode:'string'}).notNull(), note: text('note'),
+  actorId: text('actor_id').notNull().references(() => user.id), createdAt: created(),
+}, t => [unique().on(t.tenantId,t.id), unique().on(t.tenantId,t.commandId), unique().on(t.tenantId,t.number),
+  foreignKey({columns:[t.tenantId,t.purchaseRequestId],foreignColumns:[purchaseRequests.tenantId,purchaseRequests.id]}),
+  foreignKey({columns:[t.tenantId,t.unitId],foreignColumns:[units.tenantId,units.id]})])
+export const rfqVendors = pgTable('rfq_vendors', {
+  id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull(),
+  rfqId: uuid('rfq_id').notNull(), partyId: uuid('party_id').notNull(), createdAt: created(),
+}, t => [unique().on(t.tenantId,t.rfqId,t.partyId),
+  foreignKey({columns:[t.tenantId,t.rfqId],foreignColumns:[rfqs.tenantId,rfqs.id]}),
+  foreignKey({columns:[t.tenantId,t.partyId],foreignColumns:[parties.tenantId,parties.id]})])
+// [MBX-9][PROC-003] Quotation per Vendor and item, with the commercial terms PROC-004 compares.
+// A correction inserts a new revision referencing the one it supersedes, so no price is rewritten.
+export const vendorQuotations = pgTable('vendor_quotations', {
+  id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull().references(() => tenants.id),
+  number: text('number').notNull(), commandId: uuid('command_id').notNull(),
+  rfqId: uuid('rfq_id').notNull(), partyId: uuid('party_id').notNull(), unitId: uuid('unit_id').notNull(),
+  bookDate: date('book_date',{mode:'string'}).notNull(), validUntil: date('valid_until',{mode:'string'}),
+  paymentTerm: text('payment_term'), deliveryDays: integer('delivery_days'),
+  revision: integer('revision').notNull().default(1), supersedesId: uuid('supersedes_id'),
+  actorId: text('actor_id').notNull().references(() => user.id), createdAt: created(),
+}, t => [unique().on(t.tenantId,t.id), unique().on(t.tenantId,t.commandId), unique().on(t.tenantId,t.number),
+  foreignKey({columns:[t.tenantId,t.rfqId],foreignColumns:[rfqs.tenantId,rfqs.id]}),
+  foreignKey({columns:[t.tenantId,t.partyId],foreignColumns:[parties.tenantId,parties.id]}),
+  foreignKey({columns:[t.tenantId,t.unitId],foreignColumns:[units.tenantId,units.id]}),
+  foreignKey({columns:[t.tenantId,t.supersedesId],foreignColumns:[t.tenantId,t.id]}),
+  check('vendor_quotation_revision',sql`${t.revision} > 0`),
+  check('vendor_quotation_delivery',sql`${t.deliveryDays} IS NULL OR ${t.deliveryDays} > 0`),
+  check('vendor_quotation_validity',sql`${t.validUntil} IS NULL OR ${t.validUntil} >= ${t.bookDate}`),
+  check('vendor_quotation_revision_link',sql`(${t.revision} = 1) = (${t.supersedesId} IS NULL)`)])
+export const vendorQuotationLines = pgTable('vendor_quotation_lines', {
+  id: uuid('id').primaryKey().defaultRandom(), tenantId: uuid('tenant_id').notNull(),
+  quotationId: uuid('quotation_id').notNull(), lineNo: integer('line_no').notNull(),
+  itemId: uuid('item_id').notNull(), quantity: bigint('quantity',{mode:'bigint'}).notNull(),
+  unitPrice: bigint('unit_price',{mode:'bigint'}).notNull(), createdAt: created(),
+}, t => [unique().on(t.tenantId,t.quotationId,t.lineNo),
+  foreignKey({columns:[t.tenantId,t.quotationId],foreignColumns:[vendorQuotations.tenantId,vendorQuotations.id]}),
+  foreignKey({columns:[t.tenantId,t.itemId],foreignColumns:[items.tenantId,items.id]}),
+  check('vendor_quotation_line_no',sql`${t.lineNo} > 0`),
+  check('vendor_quotation_line_quantity',sql`${t.quantity} > 0`), check('vendor_quotation_line_price',sql`${t.unitPrice} > 0`)])
