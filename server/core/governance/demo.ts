@@ -34,6 +34,10 @@ const billingMappings = [
   { eventType: 'bill_received', debit: 'DEMO-5100', credit: 'DEMO-2100' },
   { eventType: 'payment_received', debit: 'DEMO-1100', credit: 'DEMO-1200' },
   { eventType: 'payment_made', debit: 'DEMO-2100', credit: 'DEMO-1100' },
+  // [MBX-8][PAY-003] A refund mirrors the payment it corrects: cash received is credited back
+  // against receivables, cash paid is debited back against payables. No clearing account.
+  { eventType: 'sales_refund', debit: 'DEMO-1200', credit: 'DEMO-1100' },
+  { eventType: 'purchase_refund', debit: 'DEMO-1100', credit: 'DEMO-2100' },
 ] as const
 export async function seedDummy(db: Database, actorId: string, tenantId: string) {
   return withActor(db,actorId,tenantId,async (tx,actor) => {

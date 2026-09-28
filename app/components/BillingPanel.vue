@@ -5,6 +5,7 @@ type CashAccount = { id: string; unitId: string; code: string; name: string; kin
 type LedgerAccount = { id: string; code: string; name: string; kind: string }
 type Document = { id: string; type: string; number: string; unitId: string; partyId: string; bookDate: string; dueDate: string; amount: string; outstanding: string; status: string }
 type Payment = { id: string; direction: string; number: string; unitId: string; partyId: string; cashAccountId: string; bookDate: string; amount: string; allocated: string; status: string; voidedBy: string | null }
+type Refund = { id: string; paymentId: string; documentId: string; amount: string; bookDate: string; reason: string; reference: string | null; paymentNumber: string; direction: string }
 type Party = { id: string; name: string; roles: { role: string; unitId: string | null }[] }
 type Unit = { id: string; name: string }
 type Aging = { asOf: string; type: string; buckets: Record<string, string>; rows: { party_id: string | null; party_name: string | null; bucket: string; documents: number; outstanding: string }[] }
@@ -19,7 +20,8 @@ const tabLabels = { accounts: 'Kas & Bank', documents: 'Tagihan', aging: 'Umur P
 const bucketLabels: Record<string, string> = { current: 'Belum jatuh tempo', '1-30': '1–30 hari', '31-60': '31–60 hari', '61-90': '61–90 hari', '90+': 'Lebih dari 90 hari' }
 
 const units = ref<Unit[]>([]), parties = ref<Party[]>([]), ledger = ref<LedgerAccount[]>([])
-const accounts = ref<CashAccount[]>([]), documents = ref<Document[]>([]), payments = ref<Payment[]>([])
+const accounts = ref<CashAccount[]>([]), documents = ref<Document[]>([]), payments = ref<Payment[]>([]), refunds = ref<Refund[]>([])
+const allocations = ref<{ paymentId: string; documentId: string; amount: string; unitId: string; direction: string; paymentNumber: string }[]>([])
 const aging = ref<Aging | null>(null)
 const busy = ref(false), message = ref(''), success = ref(false)
 const filterUnit = ref(''), filterDocumentType = ref(''), filterDocumentStatus = ref('')
@@ -31,6 +33,7 @@ const paymentForm = ref({ direction: 'in', unitId: '', partyId: '', cashAccountI
 const allocationForm = ref({ paymentId: '', documentId: '', amount: '' })
 const voidForm = ref({ documentId: '', reason: '' })
 const voidPaymentForm = ref({ paymentId: '', reason: '', reversalDate: new Date().toISOString().slice(0, 10) })
+const refundForm = ref({ paymentId: '', documentId: '', amount: '', reason: '', bookDate: new Date().toISOString().slice(0, 10) })
 
 const idr = (value: string) => new Intl.NumberFormat('id-ID').format(BigInt(value || '0'))
 const unitName = (id: string) => units.value.find(unit => unit.id === id)?.name || 'Unit'
@@ -47,6 +50,18 @@ const allocatablePayments = computed(() => payments.value.filter(payment => paym
 const outstandingTotal = computed(() => documents.value.filter(document => document.status === 'open').reduce((sum, document) => sum + BigInt(document.outstanding), 0n).toString())
 const unallocatedTotal = computed(() => payments.value.reduce((sum, payment) => sum + (payment.status === 'void' ? 0n : BigInt(payment.amount) - BigInt(payment.allocated)), 0n).toString())
 const agingTotal = computed(() => Object.values(aging.value?.buckets || {}).reduce((sum, value) => sum + BigInt(value), 0n).toString())
+// [MBX-8][PAY-003][BILL-001] A refund is only meaningful where this payment actually settled a
+// document, and it can never return more than was collected there, so the UI offers exactly
+// those pairs and leaves the collective bound to the database guard behind them.
+const refundablePairs = computed(() => allocations.value.map(allocation => {
+  const document = documents.value.find(row => row.id === allocation.documentId)
+  const refunded = refunds.value.filter(row => row.paymentId === allocation.paymentId && row.documentId === allocation.documentId).reduce((sum, row) => sum + BigInt(row.amount), 0n)
+  return { key: allocation.paymentId + allocation.documentId, paymentId: allocation.paymentId, documentId: allocation.documentId,
+    label: allocation.paymentNumber + ' → ' + (document?.number || 'dokumen'), remaining: (BigInt(allocation.amount) - refunded).toString() }
+}).filter(pair => BigInt(pair.remaining) > 0n))
+const refundablePayments = computed(() => payments.value.filter(payment => payment.status === 'posted' && refundablePairs.value.some(pair => pair.paymentId === payment.id)))
+const refundableDocuments = computed(() => refundablePairs.value.filter(pair => pair.paymentId === refundForm.value.paymentId))
+const refundedTotal = computed(() => refunds.value.reduce((sum, row) => sum + BigInt(row.amount), 0n).toString())
 
 function navigateTabs(event: KeyboardEvent) {
   const index = tabs.value.indexOf(activeTab.value)
@@ -64,11 +79,13 @@ async function load() {
   busy.value = true; message.value = ''
   try {
     const scoped = filterUnit.value ? { unitId: filterUnit.value } : {}
-    const [accountRows, paymentRows] = await Promise.all([
+    const [accountRows, paymentRows, refundRows, allocationRows] = await Promise.all([
       $fetch<CashAccount[]>(root.value + '/cash-accounts', { query: scoped }),
       $fetch<Payment[]>(root.value + '/payments', { query: scoped }),
+      $fetch<Refund[]>(root.value + '/refunds', { query: scoped }),
+      $fetch<{ paymentId: string; documentId: string; amount: string; unitId: string; direction: string; paymentNumber: string }[]>(root.value + '/allocations', { query: scoped }),
     ])
-    accounts.value = accountRows; payments.value = paymentRows
+    accounts.value = accountRows; payments.value = paymentRows; refunds.value = refundRows; allocations.value = allocationRows
     documents.value = await $fetch<Document[]>(root.value + '/documents', { query: { ...scoped, ...(filterDocumentType.value ? { type: filterDocumentType.value } : {}), ...(filterDocumentStatus.value ? { status: filterDocumentStatus.value } : {}) } })
     const all: Unit[] = []
     for (let page = 1; page <= 1000; page++) {
@@ -132,6 +149,18 @@ async function voidPayment() {
   await save(() => $fetch(root.value + '/payments/void', { method: 'POST', body }), 'Pembayaran berhasil dibatalkan dan jurnal asalnya dibalik.')
   if (success.value) voidPaymentForm.value = { paymentId: '', reason: '', reversalDate: new Date().toISOString().slice(0, 10) }
 }
+// [MBX-8][PAY-003][BILL-001] A refund returns cash to the account that received it and restores
+// the document outstanding. It is bounded by what this payment collected on this document, so
+// the form offers only real collected pairs and lets the server guard own the final check.
+async function refundPayment() {
+  const { paymentId, documentId, amount, reason, bookDate } = refundForm.value
+  await save(() => $fetch(root.value + '/payments/refund', { method: 'POST', body: { paymentId, documentId, amount, reason, reference: null, eventId: crypto.randomUUID(), bookDate } }), 'Refund berhasil dicatat dan outstanding dokumen dipulihkan.')
+  if (success.value) refundForm.value = { ...refundForm.value, paymentId: '', documentId: '', amount: '', reason: '' }
+}
+function selectRefundPair() {
+  const pair = refundableDocuments.value.find(row => row.documentId === refundForm.value.documentId)
+  refundForm.value.amount = pair?.remaining || ''
+}
 async function loadAging() {
   busy.value = true; message.value = ''
   try { aging.value = await $fetch<Aging>(root.value + '/aging', { query: { asOf: asOf.value, type: agingType.value, ...(filterUnit.value ? { unitId: filterUnit.value } : {}) } }) }
@@ -161,7 +190,7 @@ onMounted(load)
   <section class="billing-page" :aria-busy="busy">
     <div class="billing-overview">
       <div><span class="eyebrow muted">ALUR UANG BUMDES</span><h2>Kas &amp; Tagihan</h2><p>Catat penerimaan dan pengeluaran kas, pantau piutang usaha, dan alokasikan pembayaran ke dokumen.</p></div>
-      <div class="billing-summary" aria-label="Ringkasan kas dan tagihan"><div><strong>{{ accounts.length }}</strong><span>Akun kas</span></div><div><strong>Rp {{ idr(outstandingTotal) }}</strong><span>Outstanding</span></div><div><strong>Rp {{ idr(unallocatedTotal) }}</strong><span>Belum dialokasikan</span></div><span class="currency-badge">IDR · Rupiah bulat</span></div>
+      <div class="billing-summary" aria-label="Ringkasan kas dan tagihan"><div><strong>{{ accounts.length }}</strong><span>Akun kas</span></div><div><strong>Rp {{ idr(outstandingTotal) }}</strong><span>Outstanding</span></div><div><strong>Rp {{ idr(unallocatedTotal) }}</strong><span>Belum dialokasikan</span></div><div><strong>Rp {{ idr(refundedTotal) }}</strong><span>Refund</span></div><span class="currency-badge">IDR · Rupiah bulat</span></div>
     </div>
     <p v-if="message" :class="['notice', success ? 'success' : 'error']" :role="success ? 'status' : 'alert'">{{ message }}</p>
     <div class="billing-tabs" role="tablist" aria-label="Bagian kas dan tagihan">
@@ -198,6 +227,7 @@ onMounted(load)
         <div class="panel billing-action-card"><span class="action-icon"><AppIcon name="plus" :size="18" /></span><h3>Catat pembayaran</h3><p>Pembayaran selalu menunjuk satu Party aktif dan satu akun kas Unit.</p><form @submit.prevent="addPayment"><div class="form-pair"><label class="field">Arah<select v-model="paymentForm.direction" :disabled="busy" @change="paymentForm.partyId = ''"><option value="in">Masuk (dari customer)</option><option value="out">Keluar (ke vendor)</option></select></label><label class="field">Unit Usaha<select v-model="paymentForm.unitId" required :disabled="busy" @change="paymentForm.partyId = ''; paymentForm.cashAccountId = ''"><option v-for="unit in units" :key="unit.id" :value="unit.id">{{ unit.name }}</option></select></label></div><label class="field">Party<select v-model="paymentForm.partyId" required :disabled="busy || !paymentParties.length"><option value="">{{ paymentParties.length ? 'Pilih Party' : 'Party belum tersedia untuk Unit ini' }}</option><option v-for="party in paymentParties" :key="party.id" :value="party.id">{{ party.name }}</option></select></label><div class="form-pair"><label class="field">Akun kas<select v-model="paymentForm.cashAccountId" required :disabled="busy || !unitCashAccounts.length"><option value="">{{ unitCashAccounts.length ? 'Pilih akun kas' : 'Belum ada akun kas aktif' }}</option><option v-for="account in unitCashAccounts" :key="account.id" :value="account.id">{{ account.code }} · {{ account.name }}</option></select></label><label class="field">Tanggal buku<input v-model="paymentForm.bookDate" type="date" required :disabled="busy"></label></div><label class="field">Nilai (Rp)<input v-model="paymentForm.amount" required inputmode="numeric" pattern="[0-9]+" placeholder="Contoh: 500000" :disabled="busy"></label><button class="button primary billing-submit" :disabled="busy || !paymentParties.length || !unitCashAccounts.length">{{ busy ? 'Menyimpan…' : 'Simpan pembayaran' }}</button></form></div>
         <div class="panel billing-action-card"><span class="action-icon"><AppIcon name="arrow" :size="18" /></span><h3>Alokasikan pembayaran</h3><p>Alokasi tidak boleh melebihi sisa pembayaran atau outstanding dokumen.</p><form @submit.prevent="allocate"><label class="field">Pembayaran<select v-model="allocationForm.paymentId" required :disabled="busy" @change="allocationForm.documentId = ''"><option value="">Pilih pembayaran</option><option v-for="payment in allocatablePayments" :key="payment.id" :value="payment.id">{{ payment.number }} · sisa {{ idr((BigInt(payment.amount) - BigInt(payment.allocated)).toString()) }}</option></select></label><label class="field">Dokumen<select v-model="allocationForm.documentId" required :disabled="busy || !allocationForm.paymentId"><option value="">{{ allocationForm.paymentId ? (openDocuments.length ? 'Pilih dokumen terbuka' : 'Tidak ada dokumen terbuka') : 'Pilih pembayaran dahulu' }}</option><option v-for="document in openDocuments" :key="document.id" :value="document.id">{{ document.number }} · {{ idr(document.outstanding) }}</option></select></label><label class="field">Nominal alokasi (Rp)<input v-model="allocationForm.amount" required inputmode="numeric" pattern="[0-9]+" :disabled="busy" placeholder="Contoh: 500000"></label><button class="button primary billing-submit" :disabled="busy || !allocationForm.paymentId || !allocationForm.documentId">{{ busy ? 'Mengalokasikan…' : 'Alokasikan' }}</button></form></div>
         <div class="panel billing-action-card"><span class="action-icon warning"><AppIcon name="close" :size="18" /></span><h3>Batalkan pembayaran</h3><p>Pembatalan membalik jurnal asal dan hanya berlaku bila pembayaran belum menerima alokasi apa pun.</p><form @submit.prevent="voidPayment"><label class="field">Pembayaran<select v-model="voidPaymentForm.paymentId" required :disabled="busy" @change="selectVoidPayment"><option value="">Pilih pembayaran tercatat</option><option v-for="payment in payments.filter(p => p.status === 'posted')" :key="payment.id" :value="payment.id">{{ payment.number }} · {{ idr((BigInt(payment.amount) - BigInt(payment.allocated)).toString()) }} belum tersettel</option></select></label><label class="field">Tanggal pembalik<input v-model="voidPaymentForm.reversalDate" type="date" required :disabled="busy"></label><label class="field">Alasan<input v-model="voidPaymentForm.reason" required maxlength="500" placeholder="Contoh: salah input kas" :disabled="busy"></label><button class="button primary billing-submit" :disabled="busy || !voidPaymentForm.paymentId">{{ busy ? 'Memproses…' : 'Batalkan pembayaran' }}</button></form></div>
+        <div class="panel billing-action-card"><span class="action-icon"><AppIcon name="arrow" :size="18" /></span><h3>Refund pembayaran</h3><p>Refund mengkredit kembali akun kas asal dan memulihkan outstanding dokumen sebesar nilai yang dikembalikan.</p><form @submit.prevent="refundPayment"><label class="field">Pembayaran<select v-model="refundForm.paymentId" required :disabled="busy" @change="refundForm.documentId = ''; refundForm.amount = ''"><option value="">Pilih pembayaran</option><option v-for="payment in refundablePayments" :key="payment.id" :value="payment.id">{{ payment.number }}</option></select></label><label class="field">Dokumen teralokasi<select v-model="refundForm.documentId" required :disabled="busy || !refundForm.paymentId" @change="selectRefundPair"><option value="">{{ refundForm.paymentId ? (refundableDocuments.length ? 'Pilih dokumen' : 'Tidak ada dokumen teralokasi') : 'Pilih pembayaran dahulu' }}</option><option v-for="pair in refundableDocuments" :key="pair.key" :value="pair.documentId">{{ pair.label }} · sisa refund {{ idr(pair.remaining) }}</option></select></label><label class="field">Nominal refund (Rp)<input v-model="refundForm.amount" required inputmode="numeric" pattern="[0-9]+" :disabled="busy" placeholder="Contoh: 250000"></label><label class="field">Tanggal buku<input v-model="refundForm.bookDate" type="date" required :disabled="busy"></label><label class="field">Alasan<input v-model="refundForm.reason" required maxlength="500" placeholder="Contoh: barang dikembalikan" :disabled="busy"></label><button class="button primary billing-submit" :disabled="busy || !refundForm.documentId">{{ busy ? 'Memproses…' : 'Catat refund' }}</button></form></div>
       </aside>
     </div>
   </section>

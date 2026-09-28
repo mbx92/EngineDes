@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, sql } from 'drizzle-orm'
 import { z } from 'zod'
-import { cashAccounts, financialDocumentEvents, financialDocuments, journals, ledgerAccounts, parties, partyRoles, paymentAllocations, payments, auditEvents } from '../../database/schema'
+import { cashAccounts, financialDocumentEvents, financialDocuments, journals, ledgerAccounts, parties, partyRoles, paymentAllocations, paymentRefunds, payments, auditEvents } from '../../database/schema'
 import type { Transaction } from '../../database/client'
 import { AccessDenied, requirePermission, type ActorAccess } from '../iam/access'
 import { lockAdministration, ManagementConflict } from '../iam/users'
@@ -68,6 +68,7 @@ const serializedDocument = (row: typeof financialDocuments.$inferSelect) =>
   ({ ...row, amount: row.amount.toString(), outstanding: row.outstanding.toString() })
 const serializedPayment = (row: typeof payments.$inferSelect) =>
   ({ ...row, amount: row.amount.toString(), allocated: row.allocated.toString() })
+const serializedRefund = (row: typeof paymentRefunds.$inferSelect) => ({ ...row, amount: row.amount.toString() })
 
 // [MBX-8][BILL-001][ACC-004][MAP-001..004] Outstanding is stored and only ever decreases.
 // The ledger effect comes from Accounting Mapping, never from an account ID in this module.
@@ -213,7 +214,84 @@ export async function voidPayment(tx: Transaction, actor: ActorAccess, input: un
   return serializedPayment(updated!)
 }
 
-// [MBX-8][PAY-001/002] Incoming cash settles receivables; outgoing cash settles payables.
+// [MBX-8][PAY-003][BILL-001][MAP-001..004][AUDIT-001] A refund credits cash back to the same
+// cash/bank account that received the payment and restores the document outstanding by the
+// refunded amount, because BILL-001 counts refund effects as part of what settles a document.
+// It is bounded by what was actually allocated from that payment to that document, so the
+// collected history (payment_allocations) stays immutable and a tenant can never give back more
+// than it collected. The accounting effect is a `payment_refunded` Business Event resolved by
+// Accounting Mapping rather than a raw journal reversal, so no account ID enters this module.
+export async function refundPayment(tx: Transaction, actor: ActorAccess, input: unknown, requestId: string) {
+  const data = z.object({
+    paymentId: z.uuid(), documentId: z.uuid(), amount: positive,
+    reason: z.string().trim().min(1).max(500), reference: z.string().trim().max(120).nullable().default(null),
+    eventId: z.uuid(), bookDate: bookDateInput,
+  }).strict().parse(input)
+  const [payment] = await tx.select().from(payments).where(and(eq(payments.tenantId, actor.tenantId), eq(payments.id, data.paymentId)))
+  if (!payment) throw new AccessDenied('Payment unavailable')
+  await lockAdministration(tx, actor, 'financial.post', payment.unitId, payment.locationId || undefined)
+  if (payment.status !== 'posted') throw new ManagementConflict('Pembayaran tidak dalam status posted.')
+  const retry = (await tx.select().from(paymentRefunds).where(and(eq(paymentRefunds.tenantId, actor.tenantId), eq(paymentRefunds.commandId, data.eventId))))[0]
+  if (retry) return serializedRefund(retry)
+  const [document] = await tx.select().from(financialDocuments).where(and(eq(financialDocuments.tenantId, actor.tenantId), eq(financialDocuments.id, data.documentId)))
+  if (!document) throw new AccessDenied('Document unavailable')
+  if (document.status === 'void') throw new ManagementConflict('Dokumen sudah dibatalkan.')
+  const [allocation] = await tx.select().from(paymentAllocations).where(and(eq(paymentAllocations.tenantId, actor.tenantId),
+    eq(paymentAllocations.paymentId, payment.id), eq(paymentAllocations.documentId, document.id)))
+  if (!allocation) throw new ManagementConflict('Refund membutuhkan alokasi pembayaran pada dokumen ini.')
+  const prior = await tx.select({ amount: paymentRefunds.amount }).from(paymentRefunds).where(and(eq(paymentRefunds.tenantId, actor.tenantId),
+    eq(paymentRefunds.paymentId, payment.id), eq(paymentRefunds.documentId, document.id)))
+  const refunded = prior.reduce((sum, row) => sum + row.amount, 0n)
+  if (refunded + BigInt(data.amount) > allocation.amount) throw new ManagementConflict('Refund melebihi nilai yang dialokasikan ke dokumen.')
+  // [MAP-001..004] The credit direction is carried by the event type: a refund of cash received
+  // credits the original cash account and debits AR; a refund of cash paid does the AP-side mirror.
+  const eventType = payment.direction === 'in' ? 'sales_refund' : 'purchase_refund'
+  await postBusinessEvent(tx, actor, {
+    eventId: data.eventId, eventType, schemaVersion: 1, bookDate: data.bookDate, unitId: payment.unitId,
+    locationId: payment.locationId, partyId: payment.partyId, partyRole: payment.direction === 'in' ? 'customer' : 'vendor',
+    createsAR: false, amounts: { total: data.amount },
+  }, requestId)
+  const [refund] = await tx.insert(paymentRefunds).values({ tenantId: actor.tenantId, paymentId: payment.id, documentId: document.id,
+    amount: BigInt(data.amount), commandId: data.eventId, bookDate: data.bookDate, reason: data.reason, reference: data.reference, actorId: actor.userId }).returning()
+  const [restored] = await tx.select({ outstanding: financialDocuments.outstanding, status: financialDocuments.status }).from(financialDocuments)
+    .where(and(eq(financialDocuments.tenantId, actor.tenantId), eq(financialDocuments.id, document.id)))
+  await tx.insert(financialDocumentEvents).values({ tenantId: actor.tenantId, documentId: document.id, action: 'refunded',
+    actorId: actor.userId, reason: data.reason, reference: data.reference })
+  await tx.insert(auditEvents).values({ tenantId: actor.tenantId, actorId: actor.userId, action: 'payment.refunded', entityId: payment.id, requestId,
+    before: { documentId: document.id, outstanding: document.outstanding.toString(), allocated: allocation.amount.toString(), refunded: refunded.toString() },
+    after: { refundId: refund!.id, amount: data.amount, reason: data.reason, reference: data.reference, outstanding: restored!.outstanding.toString(), status: restored!.status } })
+  return serializedRefund(refund!)
+}
+
+export async function listRefunds(tx: Transaction, actor: ActorAccess, query: unknown) {
+  const q = z.object({ unitId: z.uuid().optional(), paymentId: z.uuid().optional(), documentId: z.uuid().optional(), page: pageInput }).parse(query)
+  requirePermission(actor, 'financial.read', q.unitId)
+  return (await tx.select({ refund: paymentRefunds, unitId: payments.unitId, direction: payments.direction, paymentNumber: payments.number })
+    .from(paymentRefunds).innerJoin(payments, and(eq(payments.tenantId, paymentRefunds.tenantId), eq(payments.id, paymentRefunds.paymentId)))
+    .where(and(eq(paymentRefunds.tenantId, actor.tenantId),
+      q.unitId ? eq(payments.unitId, q.unitId) : undefined,
+      q.paymentId ? eq(paymentRefunds.paymentId, q.paymentId) : undefined,
+      q.documentId ? eq(paymentRefunds.documentId, q.documentId) : undefined))
+    .orderBy(desc(paymentRefunds.bookDate), desc(paymentRefunds.createdAt)).limit(50).offset((q.page - 1) * 50))
+    .map(row => ({ ...serializedRefund(row.refund), unitId: row.unitId, direction: row.direction, paymentNumber: row.paymentNumber }))
+}
+
+// [MBX-8][PAY-003][BILL-001] Which payments settled which documents, per pair. Reading this is
+// what lets a caller refund up to the collected amount instead of guessing at the bound.
+export async function listAllocations(tx: Transaction, actor: ActorAccess, query: unknown) {
+  const q = z.object({ unitId: z.uuid().optional(), paymentId: z.uuid().optional(), documentId: z.uuid().optional(), page: pageInput }).parse(query)
+  requirePermission(actor, 'financial.read', q.unitId)
+  return (await tx.select({ paymentId: paymentAllocations.paymentId, documentId: paymentAllocations.documentId, amount: paymentAllocations.amount,
+    actorId: paymentAllocations.actorId, createdAt: paymentAllocations.createdAt, unitId: payments.unitId, direction: payments.direction, paymentNumber: payments.number })
+    .from(paymentAllocations).innerJoin(payments, and(eq(payments.tenantId, paymentAllocations.tenantId), eq(payments.id, paymentAllocations.paymentId)))
+    .where(and(eq(paymentAllocations.tenantId, actor.tenantId),
+      q.unitId ? eq(payments.unitId, q.unitId) : undefined,
+      q.paymentId ? eq(paymentAllocations.paymentId, q.paymentId) : undefined,
+      q.documentId ? eq(paymentAllocations.documentId, q.documentId) : undefined))
+    .orderBy(desc(paymentAllocations.createdAt)).limit(50).offset((q.page - 1) * 50))
+    .map(row => ({ ...row, amount: row.amount.toString() }))
+}
+
 // Bounds and balance updates are enforced by the payment_allocation_guard trigger inside this
 // same transaction, so a concurrent caller cannot oversell the same outstanding balance.
 export async function allocatePayment(tx: Transaction, actor: ActorAccess, input: unknown, requestId: string) {
