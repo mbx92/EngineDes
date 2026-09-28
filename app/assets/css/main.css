@@ -1185,7 +1185,8 @@ tbody tr:hover{
 .section-actions { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 22px; }
 .section-actions > p { color: #8492a3; font-size: 12px; line-height: 1.7; }
 .select-control, .field select { background: white; border: 1px solid #dbe2e9; border-radius: 8px; color: #526176; padding: 9px 12px; min-height: 38px; font-size: 12px; width: auto; }
-.field select { width: 100%; }
+/* [MBX-6][MBX-7] Form selects share the exact input metrics so field rows stay aligned. */
+.field select { width: 100%; height: 46px; padding: 0 13px; }
 .users-table { min-width: 760px; }
 .cell-secondary { display: block; color: #8d99aa; font-size: 10px; margin-top: 5px; }
 .grant-summary { font-size: 11px; line-height: 1.7; padding-block: 3px; }
