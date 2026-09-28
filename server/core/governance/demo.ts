@@ -7,7 +7,8 @@ import { createUnit } from '../organization/units'
 import { createLocation } from '../organization/locations'
 import { saveParty } from '../party/parties'
 import { setConfiguration, readConfiguration } from './configuration'
-import { units, locations, parties, user, memberships } from '../../database/schema'
+import { createLedgerAccount, setAccountingMapping } from '../accounting/engine'
+import { units, locations, parties, user, memberships, ledgerAccounts, accountingMappings } from '../../database/schema'
 // [MBX-5][ORG-001/002][PARTY-001/002] Explicit local seed; no demo credentials/financial writes.
 export async function seedDummy(db: Database, actorId: string, tenantId: string) {
   return withActor(db,actorId,tenantId,async (tx,actor) => {
@@ -48,6 +49,20 @@ export async function seedDummy(db: Database, actorId: string, tenantId: string)
     for(const [key,value] of [['customer:demo_cash',{anonymousAllowed:true}],['sequence:demo_cash',{prefix:'DEMO',scope:'tenant',reset:'never'}]] as const) {
       if(!await readConfiguration(tx,tenantId,key)){await setConfiguration(tx,actor,{key,value,expectedRevision:0},randomUUID());created++}
     }
-    return { created, units:3, locations:6, parties:5, pendingUsers:3 }
+    // [MBX-6/7] Sample chart and mapping only; never fabricate posted financial balances.
+    const financeAccounts=[]
+    for(const [code,name,kind] of [['DEMO-1100','DEMO · Kas','asset'],['DEMO-4100','DEMO · Pendapatan','revenue']] as const){
+      let row=(await tx.select().from(ledgerAccounts).where(and(eq(ledgerAccounts.tenantId,tenantId),eq(ledgerAccounts.code,code))))[0]
+      if(!row){row=await createLedgerAccount(tx,actor,{code,name,kind},randomUUID());created++}
+      if(row.name!==name||row.kind!==kind)throw new Error('DEMO account code collision')
+      financeAccounts.push(row)
+    }
+    const sampleMapping=(await tx.select().from(accountingMappings).where(and(eq(accountingMappings.tenantId,tenantId),eq(accountingMappings.eventType,'demo_cash'),eq(accountingMappings.schemaVersion,1))))[0]
+    if(!sampleMapping){
+      await setAccountingMapping(tx,actor,{eventType:'demo_cash',schemaVersion:1,expectedRevision:0,rules:[
+        {accountId:financeAccounts[0]!.id,side:'debit',amountKey:'total',unitDimension:'event_unit'},
+        {accountId:financeAccounts[1]!.id,side:'credit',amountKey:'total',unitDimension:'event_unit'}]},randomUUID());created++
+    }
+    return { created, units:3, locations:6, parties:5, pendingUsers:3, ledgerAccounts:2, accountingMappings:1 }
   })
 }

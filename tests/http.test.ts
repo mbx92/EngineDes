@@ -41,4 +41,13 @@ describe('[MBX-5][IAM-001/002] Nuxt HTTP boundary', async () => {
     }
     await expect($fetch(root + 'parties/00000000-0000-4000-8000-000000000011',{method:'PUT',body:{}})).rejects.toMatchObject({status:403})
   })
+  it('[ACC-001][MAP-001][LOCK-001] protects financial APIs at the HTTP boundary', async () => {
+    const root='/api/tenants/00000000-0000-4000-8000-000000000001/accounting/'
+    for(const path of ['accounts','mappings','periods','trial-balance','ledger']) {
+      await expect($fetch(root+path)).rejects.toMatchObject({status:401})
+    }
+    for(const path of ['accounts','mappings','periods','reversals','adjustments']) {
+      await expect($fetch(root+path,{method:'POST',body:{}})).rejects.toMatchObject({status:403})
+    }
+  })
 })

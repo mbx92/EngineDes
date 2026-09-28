@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { readMigrationFiles } from 'drizzle-orm/migrator'
-import { sql } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 import { drizzle as pgliteDrizzle } from 'drizzle-orm/pglite'
 import { drizzle as postgresDrizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
@@ -23,6 +23,7 @@ import { setConfiguration, listConfigurations } from '../server/core/governance/
 import { validateTransactionContext, requireApproval } from '../server/core/governance/transaction-context'
 import { allocateNumber } from '../server/core/governance/numbering'
 import { seedDummy } from '../server/core/governance/demo'
+import { createLedgerAccount, setAccountingMapping, postBusinessEvent, closeAccountingPeriod, reverseJournal, adjustJournal, trialBalance, ledger } from '../server/core/accounting/engine'
 
 const A = '00000000-0000-4000-8000-000000000001', B = '00000000-0000-4000-8000-000000000002'
 const A1 = '00000000-0000-4000-8000-000000000011', A2 = '00000000-0000-4000-8000-000000000012', B1 = '00000000-0000-4000-8000-000000000021'
@@ -62,6 +63,12 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
     await pg.query(`INSERT INTO units(id,tenant_id,name,code) VALUES ($1,$4,'Toko A','A1'),($2,$4,'Jasa A','A2'),($3,$5,'Toko B','B1')`, [A1,A2,B1,A,B])
     await pg.query(`INSERT INTO memberships(id,tenant_id,user_id) VALUES ($1,$4,'admin-a'),($2,$4,'operator-a'),($3,$5,'user-b')`, [MA,MO,MB,A,B])
     await pg.query(`INSERT INTO role_grants(tenant_id,membership_id,role,scope,unit_id) VALUES ($1,$3,'admin','tenant',NULL),($1,$4,'unit_manager','unit',$5),($1,$4,'operator','unit',$6),($2,$7,'operator','tenant',NULL)`, [A,B,MA,MO,A1,A2,MB])
+    await pg.query(`INSERT INTO auth_user(id,name,email) VALUES ('finance-a','Finance A','finance-a@example.test')`)
+    await pg.query(`INSERT INTO memberships(id,tenant_id,user_id) VALUES ('00000000-0000-4000-8000-000000000103',$1,'finance-a')`,[A])
+    await pg.query(`INSERT INTO role_grants(tenant_id,membership_id,role,scope) VALUES ($1,'00000000-0000-4000-8000-000000000103','finance','tenant')`,[A])
+    await pg.query(`INSERT INTO auth_user(id,name,email) VALUES ('finance-unit-a','Finance Unit A','finance-unit-a@example.test')`)
+    await pg.query(`INSERT INTO memberships(id,tenant_id,user_id) VALUES ('00000000-0000-4000-8000-000000000104',$1,'finance-unit-a')`,[A])
+    await pg.query(`INSERT INTO role_grants(tenant_id,membership_id,role,scope,unit_id) VALUES ($1,'00000000-0000-4000-8000-000000000104','finance','unit',$2)`,[A,A1])
     auth = createAuth(db, 'test-only-secret-not-a-production-secret-123456', 'http://localhost:3000')
   })
   beforeEach(async () => { await pg.exec('SET ROLE enginedes_app') })
@@ -387,7 +394,9 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
   })
   it('[ORG-001][PARTY-001][AUDIT-001] dummy seed is idempotent and leaves users pending without demo passwords', async () => {
     const first=await seedDummy(db,'admin-a',A),second=await seedDummy(db,'admin-a',A)
-    expect(first.created).toBe(19);expect(second.created).toBe(0)
+    expect(first.created).toBe(22);expect(second.created).toBe(0)
+    expect(first.ledgerAccounts).toBe(2);expect(first.accountingMappings).toBe(1)
+    expect(await withActor(db,'admin-a',A,tx=>tx.select().from(schema.journals))).toEqual([])
     const users=await withActor(db,'admin-a',A,tx=>tx.execute(sql`SELECT m.pending,m.active FROM memberships m JOIN auth_user u ON u.id=m.user_id WHERE u.email LIKE 'demo.%@example.test'`))
     const seededUsers=rowsOf(users) as {pending:boolean;active:boolean}[]
     expect(seededUsers).toHaveLength(3);expect(seededUsers.every(u=>u.pending&&!u.active)).toBe(true)
@@ -414,6 +423,127 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
       const retries=await Promise.all(Array.from({length:8},()=>withActor(parallel,'operator-a',A,(tx,actor)=>allocateNumber(tx,actor,{...data,commandId},randomUUID()))))
       expect(new Set(retries.map(r=>r.id)).size).toBe(1)
     }finally{await connection.end()}
+  })
+
+  it('[ACC-001/002/004][MAP-001..004][ORG-003] mapped event posts balanced IDR journal and reconciles ledger', async () => {
+    const cash=await withActor(db,'admin-a',A,(tx,a)=>createLedgerAccount(tx,a,{code:'1100',name:'Kas',kind:'asset'},randomUUID()))
+    const revenue=await withActor(db,'admin-a',A,(tx,a)=>createLedgerAccount(tx,a,{code:'4100',name:'Pendapatan',kind:'revenue'},randomUUID()))
+    await withActor(db,'admin-a',A,(tx,a)=>setConfiguration(tx,a,{key:'customer:sale',value:{anonymousAllowed:true},expectedRevision:0},randomUUID()))
+    await withActor(db,'admin-a',A,(tx,a)=>setAccountingMapping(tx,a,{eventType:'sale',schemaVersion:1,expectedRevision:0,rules:[
+      {accountId:cash.id,side:'debit',amountKey:'total',unitDimension:'event_unit'},
+      {accountId:revenue.id,side:'credit',amountKey:'total',unitDimension:'event_unit'}]},randomUUID()))
+    const event={eventId:randomUUID(),eventType:'sale',schemaVersion:1,bookDate:'2026-09-28',unitId:A1,locationId:null,partyId:null,createsAR:false,amounts:{total:'125000'}}
+    await expect(withActor(db,'admin-a',A,(tx,a)=>postBusinessEvent(tx,a,event,randomUUID()))).rejects.toThrow()
+    await expect(withActor(db,'finance-a',B,(tx,a)=>postBusinessEvent(tx,a,event,randomUUID()))).rejects.toThrow()
+    const first=await withActor(db,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,event,randomUUID()))
+    const retry=await withActor(db,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,event,randomUUID()))
+    expect(retry.id).toBe(first.id)
+    await expect(withActor(db,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,{...event,amounts:{total:'125001'}},randomUUID()))).rejects.toThrow('payload berbeda')
+    await expect(withActor(db,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,{...event,eventId:randomUUID(),amounts:{total:'1.5'}},randomUUID()))).rejects.toThrow()
+    await expect(withActor(db,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,{...event,eventId:randomUUID(),amounts:{total:'10',fee:'2'}},randomUUID()))).rejects.toThrow('belum seluruhnya dipetakan')
+    const balance=await withActor(db,'finance-a',A,(tx,a)=>trialBalance(tx,a,{through:'2026-09-30',unitId:A1}))
+    expect(balance.map(b=>[b.code,b.debit,b.credit])).toEqual([['1100','125000','0'],['4100','0','125000']])
+    const entries=await withActor(db,'finance-a',A,(tx,a)=>ledger(tx,a,{accountId:cash.id,from:'2026-09-01',through:'2026-09-30',unitId:A1}))
+    expect(entries.openingBalance).toBe('0')
+    expect(entries.entries).toHaveLength(1)
+    expect(entries.entries[0]?.runningBalance).toBe('125000')
+    await expect(withActor(db,'finance-a',A,tx=>tx.execute(sql`UPDATE journals SET event_type='x' WHERE id=${first.id}`))).rejects.toThrow()
+    await expect(withActor(db,'finance-a',A,tx=>tx.execute(sql`INSERT INTO journal_lines(tenant_id,journal_id,line_no,account_id,unit_id,debit,credit) VALUES (${A},${first.id},3,${cash.id},${A1},1,0)`))).rejects.toThrow()
+    await expect(withActor(db,'finance-a',A,tx=>tx.execute(sql`INSERT INTO journal_lines(tenant_id,journal_id,line_no,account_id,unit_id,debit,credit) VALUES (${B},${first.id},3,${cash.id},${A1},1,0)`))).rejects.toThrow()
+    await expect(withActor(db,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,{...event,eventId:randomUUID(),unitId:B1},randomUUID()))).rejects.toThrow()
+  })
+  it('[ACC-002][IAM-002][MAP-003] Unit-scoped finance cannot post or read another Unit', async () => {
+    const event={eventId:randomUUID(),eventType:'sale',schemaVersion:1,bookDate:'2026-10-04',unitId:A1,locationId:null,partyId:null,createsAR:false,amounts:{total:'18'}}
+    const own=await withActor(db,'finance-unit-a',A,(tx,a)=>postBusinessEvent(tx,a,event,randomUUID()))
+    expect(own.id).toBeTruthy()
+    await expect(withActor(db,'finance-unit-a',A,(tx,a)=>postBusinessEvent(tx,a,{...event,eventId:randomUUID(),unitId:A2},randomUUID()))).rejects.toThrow()
+    await expect(withActor(db,'finance-unit-a',A,(tx,a)=>trialBalance(tx,a,{through:'2026-10-31'}))).rejects.toThrow()
+    const ownBalance=await withActor(db,'finance-unit-a',A,(tx,a)=>trialBalance(tx,a,{through:'2026-10-31',unitId:A1}))
+    expect(ownBalance.find(row=>row.code==='1100')?.debit).toBe('125018')
+  })
+  it('[MAP-001/003][PARTY-002] vendor event resolves configured accounts without customer policy', async () => {
+    const vendor=await withActor(db,'admin-a',A,(tx,a)=>saveParty(tx,a,undefined,{code:'TEST-VENDOR',name:'Supplier Test',kind:'organization',roles:[{role:'vendor',unitId:null}]},randomUUID()))
+    const [cash]=await withActor(db,'admin-a',A,tx=>tx.select().from(schema.ledgerAccounts).where(eq(schema.ledgerAccounts.code,'1100')))
+    const expense=await withActor(db,'admin-a',A,(tx,a)=>createLedgerAccount(tx,a,{code:'5100',name:'Beban Pengadaan',kind:'expense'},randomUUID()))
+    await expect(withActor(db,'finance-a',A,(tx,a)=>setAccountingMapping(tx,a,{eventType:'purchase',schemaVersion:1,expectedRevision:0,rules:[
+      {accountId:expense.id,side:'debit',amountKey:'total',unitDimension:'event_unit'},
+      {accountId:cash!.id,side:'credit',amountKey:'total',unitDimension:'event_unit'}]},randomUUID()))).rejects.toThrow()
+    await withActor(db,'admin-a',A,(tx,a)=>setAccountingMapping(tx,a,{eventType:'purchase',schemaVersion:1,expectedRevision:0,rules:[
+      {accountId:expense.id,side:'debit',amountKey:'total',unitDimension:'event_unit'},
+      {accountId:cash!.id,side:'credit',amountKey:'total',unitDimension:'event_unit'}]},randomUUID()))
+    const event={eventId:randomUUID(),eventType:'purchase',schemaVersion:1,bookDate:'2026-10-06',unitId:A1,locationId:null,partyId:vendor.id,partyRole:'vendor',createsAR:false,amounts:{total:'750'}}
+    await expect(withActor(db,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,{...event,partyId:null},randomUUID()))).rejects.toThrow('Vendor')
+    const posted=await withActor(db,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,event,randomUUID()))
+    expect(posted.mappingRevision).toBe(1)
+    const lines=await withActor(db,'finance-a',A,tx=>tx.select().from(schema.journalLines).where(eq(schema.journalLines.journalId,posted.id)))
+    expect(lines.map(l=>[l.accountId,l.unitId])).toEqual([[expense.id,A1],[cash!.id,A1]])
+  })
+  it('[ACC-001][MAP-004][LOCK-001][AUDIT-001] invalid mapping, audit rollback and closed period prevent partial journal', async () => {
+    const [mapping]=await withActor(db,'admin-a',A,tx=>tx.select().from(schema.accountingMappings).where(eq(schema.accountingMappings.eventType,'sale')))
+    const bad=await withActor(db,'admin-a',A,(tx,a)=>setAccountingMapping(tx,a,{eventType:'sale',schemaVersion:1,expectedRevision:mapping!.revision,rules:[
+      {accountId:(mapping!.rules as {accountId:string}[])[0]!.accountId,side:'debit',amountKey:'total',unitDimension:'event_unit'},
+      {accountId:(mapping!.rules as {accountId:string}[])[1]!.accountId,side:'credit',amountKey:'other',unitDimension:'event_unit'}]},randomUUID()))
+    expect(bad.revision).toBe(2)
+    const event={eventId:randomUUID(),eventType:'sale',schemaVersion:1,bookDate:'2026-09-28',unitId:A1,locationId:null,partyId:null,createsAR:false,amounts:{total:'5'}}
+    await expect(withActor(db,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,event,randomUUID()))).rejects.toThrow('Nilai untuk mapping')
+    await withActor(db,'admin-a',A,(tx,a)=>setAccountingMapping(tx,a,{eventType:'sale',schemaVersion:1,expectedRevision:2,rules:mapping!.rules},randomUUID()))
+    await expect(withActor(db,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,event,'invalid'))).rejects.toThrow()
+    const count=await withActor(db,'finance-a',A,tx=>tx.select().from(schema.journals).where(eq(schema.journals.eventId,event.eventId)))
+    expect(count).toHaveLength(0)
+    const closed=await withActor(db,'finance-a',A,(tx,a)=>closeAccountingPeriod(tx,a,'2026-09',randomUUID()))
+    await expect(withActor(db,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,event,randomUUID()))).rejects.toThrow('ditutup')
+    try {
+      await withActor(db,'finance-a',A,tx=>tx.execute(sql`INSERT INTO journals(tenant_id,event_id,fingerprint,event_type,schema_version,book_date,kind,actor_id) VALUES (${A},${randomUUID()},'direct','direct',1,'2026-09-28','normal','finance-a')`))
+      throw new Error('Direct locked-period insert unexpectedly succeeded')
+    } catch(error) {
+      expect(String((error as {cause?:Error}).cause || error)).toContain('Accounting period is closed')
+    }
+    await expect(withActor(db,'finance-a',A,tx=>tx.execute(sql`DELETE FROM accounting_periods WHERE id=${closed.id}`))).rejects.toThrow()
+  })
+  it('[ACC-003][IAM-002] Unit-scoped correction cannot reference another Unit journal', async () => {
+    const event={eventId:randomUUID(),eventType:'sale',schemaVersion:1,bookDate:'2026-10-07',unitId:A2,locationId:null,partyId:null,createsAR:false,amounts:{total:'100'}}
+    const original=await withActor(db,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,event,randomUUID()))
+    const [cash,revenue]=await withActor(db,'admin-a',A,tx=>tx.select().from(schema.ledgerAccounts).where(sql`${schema.ledgerAccounts.code} IN ('1100','4100')`).orderBy(schema.ledgerAccounts.code))
+    await expect(withActor(db,'finance-unit-a',A,(tx,a)=>reverseJournal(tx,a,{eventId:randomUUID(),bookDate:'2026-10-08',originalJournalId:original.id},randomUUID()))).rejects.toThrow()
+    await expect(withActor(db,'finance-unit-a',A,(tx,a)=>adjustJournal(tx,a,{eventId:randomUUID(),bookDate:'2026-10-08',originalJournalId:original.id,lines:[
+      {accountId:cash!.id,unitId:A1,side:'debit',amount:'100'},
+      {accountId:revenue!.id,unitId:A1,side:'credit',amount:'100'}]},randomUUID()))).rejects.toThrow()
+  })
+  it('[ACC-003/005] reversal and adjustment append references in an open period', async () => {
+    const [original]=await withActor(db,'finance-a',A,tx=>tx.select().from(schema.journals).where(eq(schema.journals.eventType,'sale')))
+    const reversed=await withActor(db,'finance-a',A,(tx,a)=>reverseJournal(tx,a,{eventId:randomUUID(),bookDate:'2026-10-01',originalJournalId:original!.id},randomUUID()))
+    expect(reversed.correctsId).toBe(original!.id)
+    const source=await withActor(db,'finance-a',A,tx=>tx.select().from(schema.journalLines).where(eq(schema.journalLines.journalId,original!.id)))
+    const adjustment=await withActor(db,'finance-a',A,(tx,a)=>adjustJournal(tx,a,{eventId:randomUUID(),bookDate:'2026-10-02',originalJournalId:original!.id,lines:[
+      {accountId:source[0]!.accountId,unitId:A1,side:'debit',amount:'10'},
+      {accountId:source[1]!.accountId,unitId:A1,side:'credit',amount:'10'}]},randomUUID()))
+    expect(adjustment.correctsId).toBe(original!.id)
+    await expect(withActor(db,'finance-a',A,(tx,a)=>reverseJournal(tx,a,{eventId:randomUUID(),bookDate:'2026-10-03',originalJournalId:original!.id},randomUUID()))).rejects.toThrow()
+  })
+
+  it.runIf(!!process.env.TEST_RUNTIME_DATABASE_URL)('[ACC-001/005][MAP-004] concurrent retry and close serialize on real PostgreSQL', async () => {
+    const connection=postgres(process.env.TEST_RUNTIME_DATABASE_URL!,{max:8}),parallel=postgresDrizzle(connection,{schema})
+    try {
+      const event={eventId:randomUUID(),eventType:'sale',schemaVersion:1,bookDate:'2026-11-05',unitId:A1,locationId:null,partyId:null,createsAR:false,amounts:{total:'99'}}
+      const retries=await Promise.all(Array.from({length:8},()=>withActor(parallel,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,event,randomUUID()))))
+      expect(new Set(retries.map(j=>j.id)).size).toBe(1)
+      const second={...event,eventId:randomUUID(),bookDate:'2026-12-05'}
+      const race=await Promise.allSettled([
+        withActor(parallel,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,second,randomUUID())),
+        withActor(parallel,'finance-a',A,(tx,a)=>closeAccountingPeriod(tx,a,'2026-12',randomUUID())),
+      ])
+      expect(race[1].status).toBe('fulfilled')
+      const count=await withActor(db,'finance-a',A,tx=>tx.select().from(schema.journals).where(eq(schema.journals.eventId,second.eventId)))
+      expect(count.length).toBe(race[0].status==='fulfilled'?1:0)
+      await expect(withActor(db,'finance-a',A,(tx,a)=>postBusinessEvent(tx,a,{...second,eventId:randomUUID()},randomUUID()))).rejects.toThrow('ditutup')
+    } finally { await connection.end() }
+  })
+  it('[ACC-001][NFR-SEC-002] database rejects an incomplete or cross-tenant posted journal even with direct SQL', async () => {
+    const eventId=randomUUID()
+    await expect(withActor(db,'finance-a',A,tx=>tx.execute(sql`INSERT INTO journals(tenant_id,event_id,fingerprint,event_type,schema_version,book_date,kind,actor_id) VALUES (${A},${eventId},'test','direct',1,'2026-10-08','normal','finance-a')`))).rejects.toThrow('Journal is not balanced')
+    const exists=await withActor(db,'finance-a',A,tx=>tx.select().from(schema.journals).where(eq(schema.journals.eventId,eventId)))
+    expect(exists).toHaveLength(0)
+    await expect(withActor(db,'finance-a',A,tx=>tx.execute(sql`INSERT INTO journals(tenant_id,event_id,fingerprint,event_type,schema_version,book_date,kind,actor_id) VALUES (${B},${randomUUID()},'test','direct',1,'2026-10-08','normal','finance-a')`))).rejects.toThrow()
   })
 
 })

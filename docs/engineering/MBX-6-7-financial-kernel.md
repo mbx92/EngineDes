@@ -1,0 +1,26 @@
+# MBX-6 / MBX-7 — Phase 2 implementation plan
+
+Requirements: ACC-001..005, LOCK-001, MAP-001..004, ORG-003, IAM-001/002, AUDIT-001, CFG-001, NFR-SEC-002. Sources: Notion Functional Requirements v0.1, P0 Acceptance Criteria v0.1, ADR-001/002/003/008/009 and Linear MBX-6/7.
+
+1. Confirm and record the financial policies left open by MBX-15 before persisting money or business dates: currency/scale/rounding, posting date and period timezone, command idempotency, and posting versus closing lock order. The first three require PM confirmation; do not equate the workspace timezone to tenant policy.
+2. Implement one tenant-level chart of accounts and append-only posted journals with Unit dimension on lines. Provide authorized account setup, balanced atomic posting, reversal and adjustment references, period lock, ledger and trial balance from posted lines.
+3. Define a versioned Business Event DTO. Resolve debit/credit accounts and dimensions from revisioned tenant mapping in Core, then post through the same engine transaction. Missing or invalid mapping must roll back the entire command. Business modules pass business facts and context, never account IDs.
+4. Add tenant-aware foreign keys, forced RLS, least-privilege SQL grants, append-only protection, and transactional audit. Preserve all applied Foundation migrations.
+5. Test real PostgreSQL semantics for balance/rollback, wrong tenant/Unit, role permission, missing mapping, concurrent duplicate command and posting versus close, reversal immutability, and ledger/trial balance reconciliation. Run typecheck, build and artifact smoke. Update Linear and the relevant Notion decision/ADR before marking complete.
+
+## Implemented contract
+
+- PM confirmed IDR whole-rupiah and BUMDes-local book dates on 2026-09-28. The accepted financial contract is recorded at the top of the Notion Delivery Agreement & Decision Register. Journal amounts use PostgreSQL `bigint` and canonical integer strings; decimal amounts are rejected rather than rounded.
+- Tenant-owned chart of accounts, period-close markers, posted journals/lines and revisioned accounting mapping are in migrations 0006–0008. All new tenant tables have forced RLS. A deferred database constraint requires every committed journal to have at least two lines and equal debit/credit; database guards also reject direct posting into closed periods and preserve append-only posted history. Correction journals reference originals.
+- The posting service accepts a versioned event with immutable event UUID, local book date, Unit/optional Location, Customer or Vendor Party context, AR flag and named whole-rupiah amounts. Mapping alone selects accounts, debit/credit sides and Unit dimension; every named monetary amount must be covered by a rule. Retry identity is tenant/event UUID plus a payload fingerprint; no journal is created on missing/invalid mapping.
+- Tenant Admin configures accounts/mappings but cannot post by that role alone. Finance can post in assigned Unit scope and read ledger/trial balance within assigned Unit. Tenant-scoped Finance or Director can close periods; tenant-scoped Admin can view consolidated reports. Location-only finance grants cannot post or view Unit-wide finance until Location is stored as a reportable journal dimension. Tenant-row locking serializes mapping/account changes, posting and close.
+- The Akuntansi screen offers account creation, simple two-line mapping setup, posted trial balance/ledger and period closing according to grant. Complex mapping revisions and correction commands are available via the protected service/API; no business module or posted financial transaction UI is claimed. Phase 3/4 modules call `postBusinessEvent` within their own transaction.
+- Explicit local DEMO seed adds two sample ledger accounts and one `demo_cash` mapping, without fabricated posted amounts. It remains idempotent and creates no demo passwords.
+
+Business-module invoice/payment/retail flows, full approval workflow, and PDF financial reports remain in their consuming phases. The financial kernel must expose safe services without claiming those flows are complete.
+
+## Local verification and QA
+
+Run `corepack pnpm test:postgres`, `corepack pnpm typecheck`, `corepack pnpm build` and `corepack pnpm test:artifact`. The database harness creates and drops a disposable local PostgreSQL database under the restricted runtime role. Phase 2 coverage exercises exact IDR amounts, balanced commit enforcement, mapping/authorization failure rollback, tenant/Unit isolation, retry concurrency, post-versus-close race, append-only reversal/adjustment, financial report reconciliation and seed idempotence.
+
+The local development database has migrations 0006–0008. Running `corepack pnpm db:seed` after migration added two DEMO accounts and one DEMO mapping; a second run added zero. No journal or balance was seeded. In the UI, an Admin can inspect the sample accounts and mapping under Akuntansi. A tenant Finance user can inspect the same chart, run a trial balance, and close a test period; do not close a real operating period for UI exploration. The screen does not expose a fabricated business transaction or a general-purpose manual posting button. Phase 3 modules will supply the first real financial event flow.
