@@ -22,6 +22,27 @@
       "when": 1790506103754,
       "tag": "0002_quiet_red_shift",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1790516643199,
+      "tag": "0003_nice_shadowcat",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1790516678979,
+      "tag": "0004_foundation_isolation",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790517588847,
+      "tag": "0005_demonic_supreme_intelligence",
+      "breakpoints": true
     }
   ]
 }

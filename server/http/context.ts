@@ -8,7 +8,12 @@ import { ManagementConflict } from '../core/iam/users'
 
 export function requireSameOrigin(event: H3Event) {
   const configured = process.env.BETTER_AUTH_URL
-  if (!configured || getHeader(event, 'origin') !== new URL(configured).origin) {
+  const allowed = [configured, ...(process.env.BETTER_AUTH_TRUSTED_ORIGINS || '').split(',')]
+    .filter((value): value is string => Boolean(value))
+    .map(value => { try { return new URL(value).origin } catch { return null } })
+    .filter((value): value is string => value !== null)
+  const origin = getHeader(event, 'origin')
+  if (!origin || !allowed.includes(origin)) {
     throw createError({ statusCode: 403, statusMessage: 'Origin denied' })
   }
 }

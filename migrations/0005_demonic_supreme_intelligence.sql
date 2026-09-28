@@ -1,0 +1,2 @@
+-- [MBX-5][PARTY-002] Track the contextual-role index in generated schema metadata.
+CREATE UNIQUE INDEX IF NOT EXISTS "party_roles_context" ON "party_roles" USING btree ("tenant_id","party_id","role",COALESCE("unit_id", '00000000-0000-0000-0000-000000000000'::uuid));

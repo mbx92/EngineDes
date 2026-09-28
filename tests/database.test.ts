@@ -17,6 +17,13 @@ import { createUser, listUsers, resendInvitation, updateGrants, setAccountActive
 import { activateAccount } from '../server/core/iam/activation'
 import { updateOrganization } from '../server/core/organization/settings'
 
+import { createLocation, listLocations } from '../server/core/organization/locations'
+import { saveParty, listParties } from '../server/core/party/parties'
+import { setConfiguration, listConfigurations } from '../server/core/governance/configuration'
+import { validateTransactionContext, requireApproval } from '../server/core/governance/transaction-context'
+import { allocateNumber } from '../server/core/governance/numbering'
+import { seedDummy } from '../server/core/governance/demo'
+
 const A = '00000000-0000-4000-8000-000000000001', B = '00000000-0000-4000-8000-000000000002'
 const A1 = '00000000-0000-4000-8000-000000000011', A2 = '00000000-0000-4000-8000-000000000012', B1 = '00000000-0000-4000-8000-000000000021'
 const MA = '00000000-0000-4000-8000-000000000101', MO = '00000000-0000-4000-8000-000000000102', MB = '00000000-0000-4000-8000-000000000201'
@@ -292,4 +299,121 @@ describe('[MBX-5] PostgreSQL semantics, scoped access and authentication', () =>
       await withActor(parallel, 'admin-a', A, (tx, actor) => setAccountActive(tx, actor, invite.userId, { active: false }, randomUUID()))
     } finally { await connection.end() }
   })
+  it('[ORG-002][IAM-002] Location assignment cannot leak to another Location or whole-Unit commands', async () => {
+    const location = await withActor(db,'admin-a',A,(tx,actor)=>createLocation(tx,actor,{unitId:A1,name:'Primary',code:'LOC1'},randomUUID()))
+    const other = await withActor(db,'admin-a',A,(tx,actor)=>createLocation(tx,actor,{unitId:A1,name:'Other',code:'LOC2'},randomUUID()))
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>createLocation(tx,actor,{unitId:A1,name:'Denied',code:'DENIED'},randomUUID()))).rejects.toThrow()
+    await expect(withActor(db,'admin-a',A,(tx,actor)=>createLocation(tx,actor,{unitId:B1,name:'Denied',code:'CROSS'},randomUUID()))).rejects.toThrow()
+    await expect(withActor(db,'admin-a',A,(tx,actor)=>updateGrants(tx,actor,'operator-a',{grants:[{role:'operator',scope:'unit',unitId:A2,locationId:location.id}]},randomUUID()))).rejects.toThrow()
+    await withActor(db,'admin-a',A,(tx,actor)=>updateGrants(tx,actor,'operator-a',{grants:[{role:'operator',scope:'unit',unitId:A1,locationId:location.id}]},randomUUID()))
+    expect((await withActor(db,'operator-a',A,listLocations)).map(l=>l.id)).toEqual([location.id])
+    await withActor(db,'admin-a',A,(tx,actor)=>setConfiguration(tx,actor,{key:'customer:location_cash',value:{anonymousAllowed:true},expectedRevision:0},randomUUID()))
+    const context={type:'location_cash',unitId:A1,partyId:null,createsAR:false}
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>validateTransactionContext(tx,actor,context))).rejects.toThrow()
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>validateTransactionContext(tx,actor,{...context,locationId:other.id}))).rejects.toThrow()
+    expect(await withActor(db,'operator-a',A,(tx,actor)=>validateTransactionContext(tx,actor,{...context,locationId:location.id}))).toMatchObject({locationId:location.id,tenantId:A})
+    await expect(withActor(db,'admin-a',A,tx=>tx.execute(sql`INSERT INTO role_grants(tenant_id,membership_id,role,scope,unit_id,location_id) VALUES (${A},${MO},'operator','unit',${A2},${location.id})`))).rejects.toThrow()
+    await withActor(db,'admin-a',A,(tx,actor)=>updateGrants(tx,actor,'operator-a',{grants:[{role:'operator',scope:'unit',unitId:A1},{role:'operator',scope:'unit',unitId:A2}]},randomUUID()))
+  })
+  it('[PARTY-001/002][AUDIT-001] one identity supports Person/Organization and multiple roles with atomic audit', async () => {
+    const data={kind:'organization',name:'Supplier Customer',code:'PARTY-A',roles:[{role:'vendor',unitId:null},{role:'customer',unitId:A1}]}
+    const party=await withActor(db,'admin-a',A,(tx,actor)=>saveParty(tx,actor,undefined,data,randomUUID()))
+    expect(party.roles).toHaveLength(2)
+    const updated=await withActor(db,'admin-a',A,(tx,actor)=>saveParty(tx,actor,party.id,{...data,name:'Changed name'},randomUUID()))
+    expect(updated.id).toBe(party.id)
+    expect((await withActor(db,'operator-a',A,(tx,actor)=>listParties(tx,actor,{unitId:A1}))).find(p=>p.id===party.id)?.roles).toHaveLength(2)
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>listParties(tx,actor,{}))).rejects.toThrow()
+    await expect(withActor(db,'admin-a',A,(tx,actor)=>saveParty(tx,actor,undefined,{...data,code:'ROLLBACK-PARTY'},'invalid'))).rejects.toThrow()
+    await withActor(db,'admin-a',A,async tx=>{expect(rowsOf(await tx.execute(sql`SELECT id FROM parties WHERE code='ROLLBACK-PARTY'`))).toEqual([])})
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>saveParty(tx,actor,undefined,data,randomUUID()))).rejects.toThrow()
+    await expect(withActor(db,'admin-a',A,(tx,actor)=>saveParty(tx,actor,undefined,{...data,code:'BAD-UNIT',roles:[{role:'customer',unitId:B1}]},randomUUID()))).rejects.toThrow()
+    await expect(withActor(db,'user-b',B,tx=>tx.execute(sql`INSERT INTO party_roles(tenant_id,party_id,role) VALUES (${B},${party.id},'vendor')`))).rejects.toThrow()
+    expect((await pg.query('SELECT * FROM parties')).rows).toEqual([])
+  })
+  it('[ORG-003][PARTY-003/004] scope and customer policy gate the business write; AR requires Party', async () => {
+    await withActor(db,'admin-a',A,(tx,actor)=>setConfiguration(tx,actor,{key:'customer:retail_cash',value:{anonymousAllowed:true},expectedRevision:0},randomUUID()))
+    const context={type:'retail_cash',unitId:A1,partyId:null,createsAR:false}
+    expect(await withActor(db,'operator-a',A,(tx,actor)=>validateTransactionContext(tx,actor,context))).toMatchObject({partyId:null,unitId:A1})
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>validateTransactionContext(tx,actor,{...context,createsAR:true}))).rejects.toThrow('Identified Party required')
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>validateTransactionContext(tx,actor,{...context,type:'unconfigured'}))).rejects.toThrow()
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>validateTransactionContext(tx,actor,{...context,unitId:B1}))).rejects.toThrow()
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>validateTransactionContext(tx,actor,{...context,unitId:null}))).rejects.toThrow()
+    const party=await withActor(db,'admin-a',A,(tx,actor)=>saveParty(tx,actor,undefined,{kind:'person',name:'AR Customer',code:'AR-CUST',roles:[{role:'customer',unitId:A1}]},randomUUID()))
+    expect((await withActor(db,'operator-a',A,(tx,actor)=>listParties(tx,actor,{unitId:A2}))).some(row=>row.id===party.id)).toBe(false)
+    expect(await withActor(db,'operator-a',A,(tx,actor)=>validateTransactionContext(tx,actor,{...context,partyId:party.id,createsAR:true}))).toMatchObject({partyId:party.id})
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>validateTransactionContext(tx,actor,{...context,unitId:A2,partyId:party.id,createsAR:true}))).rejects.toThrow()
+    await expect(withActor(db,'operator-a',A,async(tx,actor)=>{
+      await tx.execute(sql`INSERT INTO units(tenant_id,name,code) VALUES (${A},'Should rollback','CONTEXT-ROLLBACK')`)
+      await validateTransactionContext(tx,actor,{...context,createsAR:true})
+    })).rejects.toThrow()
+    await withActor(db,'admin-a',A,async tx=>{expect(rowsOf(await tx.execute(sql`SELECT id FROM units WHERE code='CONTEXT-ROLLBACK'`))).toEqual([])})
+  })
+  it('[IAM-003][CFG-001] approval permission is distinct from Admin and separation of duties overrides multiple roles', async () => {
+    await withActor(db,'admin-a',A,(tx,actor)=>updateGrants(tx,actor,'operator-a',{grants:[{role:'director',scope:'unit',unitId:A1},{role:'admin',scope:'tenant',unitId:null}]},randomUUID()))
+    const document={tenantId:A,unitId:A1,creatorId:'operator-a'}
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>requireApproval(tx,actor,document))).rejects.toThrow('Creator cannot approve')
+    await expect(withActor(db,'admin-a',A,(tx,actor)=>requireApproval(tx,actor,{...document,creatorId:'someone-else'}))).rejects.toThrow()
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>requireApproval(tx,actor,{...document,unitId:A2,creatorId:'someone-else'}))).rejects.toThrow()
+    await withActor(db,'operator-a',A,(tx,actor)=>requireApproval(tx,actor,{...document,creatorId:'someone-else'}))
+    await withActor(db,'admin-a',A,(tx,actor)=>updateGrants(tx,actor,'operator-a',{grants:[{role:'operator',scope:'unit',unitId:A1},{role:'operator',scope:'unit',unitId:A2}]},randomUUID()))
+  })
+  it('[CFG-001][AUDIT-001] revision conflict, unauthorized edits and audit rollback preserve configuration', async () => {
+    const data={key:'security',value:{timezone:'Asia/Makassar',passwordMinimum:16,separationOfDuties:true},expectedRevision:0}
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>setConfiguration(tx,actor,data,randomUUID()))).rejects.toThrow()
+    await expect(withActor(db,'admin-a',A,(tx,actor)=>setConfiguration(tx,actor,{...data,value:{...data.value,timezone:'Not/AZone'}},randomUUID()))).rejects.toThrow()
+    await expect(withActor(db,'admin-a',A,(tx,actor)=>setConfiguration(tx,actor,data,'bad-audit'))).rejects.toThrow()
+    const row=await withActor(db,'admin-a',A,(tx,actor)=>setConfiguration(tx,actor,data,randomUUID()))
+    expect(row.revision).toBe(1)
+    const invite=await withActor(db,'admin-a',A,(tx,actor)=>createUser(tx,actor,{name:'Policy activation',email:'policy-activation@example.test',grants:[{role:'operator',scope:'unit',unitId:A1}]},randomUUID()))
+    await expect(activateAccount(db,{userId:invite.userId,token:invite.token,password:'Twelve-pass-1'},randomUUID())).rejects.toThrow('tenant policy')
+    await activateAccount(db,{userId:invite.userId,token:invite.token,password},randomUUID())
+    await expect(withActor(db,'admin-a',A,(tx,actor)=>setConfiguration(tx,actor,data,randomUUID()))).rejects.toThrow('telah berubah')
+    await expect(pg.exec('DELETE FROM configuration_revisions')).rejects.toThrow()
+    await expect(withActor(db,'operator-a',A,listConfigurations)).rejects.toThrow()
+    await withActor(db,'admin-a',A,(tx,actor)=>setConfiguration(tx,actor,{...data,value:{...data.value,passwordMinimum:12},expectedRevision:1},randomUUID()))
+  })
+  it('[SEQ-001][AUDIT-001] allocation retry preserves number, mismatched retry and audit rollback consume no counter', async () => {
+    await withActor(db,'admin-a',A,(tx,actor)=>setConfiguration(tx,actor,{key:'sequence:test_doc',value:{prefix:'TEST',scope:'tenant',reset:'year'},expectedRevision:0},randomUUID()))
+    const data={type:'test_doc',commandId:randomUUID(),unitId:A1,period:'2026'}
+    const first=await withActor(db,'operator-a',A,(tx,actor)=>allocateNumber(tx,actor,data,randomUUID()))
+    const retry=await withActor(db,'operator-a',A,(tx,actor)=>allocateNumber(tx,actor,data,randomUUID()))
+    expect(first.number).toBe('TEST/2026/000001');expect(retry.id).toBe(first.id)
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>allocateNumber(tx,actor,{...data,unitId:A2},randomUUID()))).rejects.toThrow('Retry context')
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>allocateNumber(tx,actor,{...data,commandId:randomUUID()},'invalid'))).rejects.toThrow()
+    const second=await withActor(db,'operator-a',A,(tx,actor)=>allocateNumber(tx,actor,{...data,commandId:randomUUID()},randomUUID()))
+    expect(second.number).toBe('TEST/2026/000002')
+    await expect(pg.exec("UPDATE document_numbers SET number=''")).rejects.toThrow()
+    await expect(withActor(db,'operator-a',A,(tx,actor)=>allocateNumber(tx,actor,{...data,commandId:randomUUID(),period:'not-year'},randomUUID()))).rejects.toThrow()
+  })
+  it('[ORG-001][PARTY-001][AUDIT-001] dummy seed is idempotent and leaves users pending without demo passwords', async () => {
+    const first=await seedDummy(db,'admin-a',A),second=await seedDummy(db,'admin-a',A)
+    expect(first.created).toBe(19);expect(second.created).toBe(0)
+    const users=await withActor(db,'admin-a',A,tx=>tx.execute(sql`SELECT m.pending,m.active FROM memberships m JOIN auth_user u ON u.id=m.user_id WHERE u.email LIKE 'demo.%@example.test'`))
+    const seededUsers=rowsOf(users) as {pending:boolean;active:boolean}[]
+    expect(seededUsers).toHaveLength(3);expect(seededUsers.every(u=>u.pending&&!u.active)).toBe(true)
+    expect((await pg.query("SELECT a.id FROM auth_account a JOIN auth_user u ON u.id=a.user_id WHERE u.email LIKE 'demo.%@example.test'")).rows).toEqual([])
+    await pg.exec('RESET ROLE')
+    await pg.query("UPDATE role_grants SET role='admin' WHERE membership_id=$1",[MB])
+    await pg.exec('SET ROLE enginedes_app')
+    try {
+      await expect(seedDummy(db,'user-b',B)).rejects.toThrow('DEMO email collision')
+      await withActor(db,'user-b',B,async tx=>{expect(rowsOf(await tx.execute(sql`SELECT id FROM units WHERE code LIKE 'DEMO-%'`))).toEqual([])})
+    } finally {
+      await pg.exec('RESET ROLE')
+      await pg.query("UPDATE role_grants SET role='operator' WHERE membership_id=$1",[MB])
+      await pg.exec('SET ROLE enginedes_app')
+    }
+  })
+  it.runIf(!!process.env.TEST_RUNTIME_DATABASE_URL)('[SEQ-001] concurrent network PostgreSQL document creation produces unique numbers and identical retry results', async () => {
+    const connection=postgres(process.env.TEST_RUNTIME_DATABASE_URL!,{max:8}),parallel=postgresDrizzle(connection,{schema})
+    try {
+      const data={type:'test_doc',unitId:A1,period:'2026'}
+      const results=await Promise.all(Array.from({length:20},()=>withActor(parallel,'operator-a',A,(tx,actor)=>allocateNumber(tx,actor,{...data,commandId:randomUUID()},randomUUID()))))
+      expect(new Set(results.map(r=>r.number)).size).toBe(20)
+      const commandId=randomUUID()
+      const retries=await Promise.all(Array.from({length:8},()=>withActor(parallel,'operator-a',A,(tx,actor)=>allocateNumber(tx,actor,{...data,commandId},randomUUID()))))
+      expect(new Set(retries.map(r=>r.id)).size).toBe(1)
+    }finally{await connection.end()}
+  })
+
 })

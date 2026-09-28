@@ -11,6 +11,7 @@ EngineDes is the implementation repository for the BUMDes Platform.
 Notion Requirement -> Linear Issue -> Branch -> Commit/PR -> Tests -> Release.
 
 Every engineering change must preserve its requirement ID and Linear issue.
+Use Conventional Commits (`feat`, `fix`, `chore`, `docs`, `test`, or `refactor`) with the relevant Linear issue and requirement IDs in the commit message.
 Example:
 - Requirement: PROC-004
 - Linear: MBX-10
